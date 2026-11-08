@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+
+# local engagement authorization — never commit (real target/authorizer)
+auth.yaml
+
+# generated source dump
+all_python_files.txt
