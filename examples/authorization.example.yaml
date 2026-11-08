@@ -1,0 +1,54 @@
+# Example active-testing authorization file for `siterecon active`.
+#
+# This is a TEMPLATE. Fill it in for a system you are authorized to test, then run:
+#   siterecon active <target> --authorization this-file.yaml --dry-run
+# and review the plan before dropping --dry-run.
+#
+# The scope is authored by hand. SiteRecon never infers it from a passive scan.
+
+target: example.com
+authorized_by: "Your Name / Role"
+authorized_on: "2026-11-08"
+
+# Wall-clock window. Active testing is refused outside it (per-engagement, not a standing permission).
+window:
+  start: "2026-11-10T00:00:00Z"
+  end: "2026-11-10T06:00:00Z"
+
+# Engagement-wide limits (clamped: rps 0.1..5.0, budget 1..1000).
+rate_limit_rps: 1.0
+max_requests: 50
+max_requests_per_check: 25
+
+scope:
+  hosts:                       # exact hostnames only; subdomains are not implicitly in scope
+    - api.example.com
+  exclude_hosts: []
+  tls_authorized_hosts: []     # add a host here to allow tls_protocol_enum against it
+
+# A check runs only if it is named here AND its configuration below is present and ready.
+checks_enabled: []
+
+# --- per-check configuration (only needed for the checks you enable) ---
+
+# supabase:
+#   host: yourref.supabase.co
+#   anon_key: "eyJ...public-anon-key..."   # public anon key ONLY (service_role is rejected)
+#   tables: [profiles, items]
+
+# function_urls:
+#   - url: "https://api.example.com/order"
+#     method: OPTIONS
+#     state_changing: true
+
+# email_endpoints:
+#   - url: "https://api.example.com/notify"
+#     method: POST
+#     burst: 5
+#     test_payload: '{"siterecon_test": true}'
+#     confirmed_no_real_delivery: true      # REQUIRED; the check is skipped without it
+
+# ip_trust_endpoints:                        # does the app trust client-supplied IP headers (XFF, etc.)?
+#   - url: "https://api.example.com/admin"
+#     method: GET
+#     access_control: true
