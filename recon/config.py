@@ -70,11 +70,14 @@ class Config:
     crawl_delay: float = 0.25           # seconds between crawl requests (robots Crawl-delay may raise it)
     respect_robots: bool = True
     # frontend assets (static analysis; never executed)
+    retain_client_keys: bool = False    # keep public client keys (e.g. Supabase anon key) unredacted; see --bypass-sec
     max_assets: int = 30
     max_asset_bytes: int = 2 * 1024 * 1024
     max_source_map_bytes: int = 8 * 1024 * 1024   # large enough to list a map's 'sources' array
     max_assets_total_bytes: int = 20 * 1024 * 1024
     asset_hosts: tuple[str, ...] = ()   # external hosts explicitly permitted for asset downloads
+    # hosting location (optional offline geolocation DB; None = ASN/RDAP country estimate only)
+    geoip_db: Path | None = None
     # history
     history: bool = True
     # limits

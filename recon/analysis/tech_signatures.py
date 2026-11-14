@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Version of the curated signature database (technology, third-party domains, verifications, trackers).
+# Bump on any change to the signature sets so a scan can record which signatures produced its detections.
+# Calendar-versioned (YYYY.MM.DD) for the first entry a given day; add a .N suffix for same-day revisions.
+SIGNATURES_VERSION: str = "2026.11.10"
+
 
 @dataclass(frozen=True, slots=True)
 class TechSignature:

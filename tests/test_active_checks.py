@@ -15,10 +15,10 @@ from recon.active.authorization import (
 )
 from recon.active.authorization import IpTrustTarget
 from recon.active.checks import (
+    BackendReadAccessCheck,
     ClientIpHeaderTrustCheck,
     EmailEndpointRateLimitCheck,
     FunctionUrlReachabilityCheck,
-    SupabaseRlsCheck,
 )
 from recon.utils.http_client import SafeHttpClient
 from recon.utils.scope import Scope
@@ -79,14 +79,15 @@ async def test_out_of_scope_request_is_blocked_and_logged():
     assert ctx.requests_made == 1   # a blocked attempt still spends budget (can't retry around it)
 
 
-# ------------------------------------------------------------------ supabase RLS
+# ------------------------------------------------------------------ backend read access (supabase adapter)
 
 def sb_auth(tables, key="eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.sig"):
+    # Uses the deprecated top-level `supabase:` block on purpose, to exercise its fold into `backends`.
     return auth(scope=ActiveScope(hosts=["sb.test"]),
                 supabase=SupabaseTarget(host="sb.test", anon_key=key, tables=tables))
 
 
-async def test_supabase_rls_flags_readable_table_only():
+async def test_backend_read_access_supabase_flags_readable_tables():
     a = sb_auth(["open_table", "locked_table", "empty_table"])
     ctx, client = context(a)
     with respx.mock:
@@ -97,18 +98,39 @@ async def test_supabase_rls_flags_readable_table_only():
         respx.get(url__startswith="https://sb.test/rest/v1/empty_table").mock(
             return_value=httpx.Response(200, content=b"[]"))
         async with client:
-            result = await SupabaseRlsCheck().run(ctx)
+            result = await BackendReadAccessCheck().run(ctx)
     assert result.requests_made == 3                       # one per table, no pagination
     ids = {f.id for f in result.findings}
-    assert "active.supabase_rls_open:sb.test/open_table" in ids
-    assert len(result.findings) == 1                       # locked (401) and empty produce no finding
+    # An authorized 200 — even an EMPTY array — is "open" (RLS did not deny); only the 401 is denied.
+    assert "active.backend_read_access_open:supabase:sb.test/open_table" in ids
+    assert "active.backend_read_access_open:supabase:sb.test/empty_table" in ids
+    assert len(result.findings) == 2                       # locked (401) produces no finding
+    assert all(f.severity.value == "high" for f in result.findings)
     assert "eyJyb2xlIjoiYW5vbiJ9" not in result.model_dump_json()   # anon key redacted in evidence
 
 
-def test_supabase_rls_skips_without_config():
-    assert SupabaseRlsCheck().prerequisites(auth()) is not None
-    assert SupabaseRlsCheck().prerequisites(sb_auth([])) is not None             # no tables
-    assert SupabaseRlsCheck().prerequisites(sb_auth(["t"])) is None
+async def test_backend_read_access_supabase_denied_when_rls_enforced():
+    a = sb_auth(["locked"])
+    ctx, client = context(a)
+    with respx.mock:
+        respx.get(url__startswith="https://sb.test/rest/v1/locked").mock(
+            return_value=httpx.Response(403, content=b'{"message":"permission denied for table"}'))
+        async with client:
+            result = await BackendReadAccessCheck().run(ctx)
+    assert result.requests_made == 1 and result.findings == []   # 403 → RLS working → no finding
+
+
+def test_backend_read_access_skips_without_config():
+    assert BackendReadAccessCheck().prerequisites(auth()) is not None            # no backends
+    assert BackendReadAccessCheck().prerequisites(sb_auth([])) is not None       # no resources
+    assert BackendReadAccessCheck().prerequisites(sb_auth(["t"])) is None
+
+
+def test_backend_read_access_skips_out_of_scope_backend():
+    # host not in scope.hosts → the backend is not probed, and the check would skip
+    a = auth(scope=ActiveScope(hosts=["app.test"]),
+             supabase=SupabaseTarget(host="sb.test", anon_key="eyJ0.eyJyb2xlIjoiYW5vbiJ9.s", tables=["t"]))
+    assert BackendReadAccessCheck().prerequisites(a) is not None
 
 
 # ------------------------------------------------------------------ function URLs

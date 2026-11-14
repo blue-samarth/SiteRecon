@@ -1,9 +1,3 @@
-'''
-Shared context for active checks: a scope-bound HTTP client, a central request budget and a central
-rate limiter. Checks ask the context to make requests; the context — not the check — enforces the
-engagement-wide budget and rate, so a buggy check can never exceed them.
-'''
-
 from __future__ import annotations
 
 import asyncio
@@ -28,14 +22,7 @@ class ActiveContext:
     Carries the authorization, a scope-bound client, the shared budget, and the rate limiter.
     '''
 
-    def __init__(
-        self,
-        auth: AuthorizationFile,
-        client: SafeHttpClient,
-        *,
-        clock: Callable[[], float] = monotonic,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> None:
+    def __init__(self, auth: AuthorizationFile, client: SafeHttpClient, *, clock: Callable[[], float] = monotonic, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep, ) -> None:
         '''
         Create a context.
         Parameters:
@@ -56,23 +43,12 @@ class ActiveContext:
         self._next_allowed = clock()
 
     @property
-    def requests_made(self) -> int:
-        '''
-        Total requests made so far.
-        Returns:
-            int: Count of reserved requests.
-        '''
-        return self._total
+    def requests_made(self) -> int: return self._total
 
-    def check_count(self, check_id: str) -> int:
-        '''
-        Requests a given check has made.
-        Parameters:
-            check_id (str): The check identifier.
-        Returns:
-            int: Count for that check.
-        '''
-        return self._per_check.get(check_id, 0)
+    def check_count(self, check_id: str) -> int: return self._per_check.get(check_id, 0)
+    def log_probe(self, check_id: str, method: str, target: str, *, status: int | None = None, note: str | None = None) -> None: self.request_log.append(RequestLogEntry(check_id=check_id, method=method, url=target, status=status, note=note))
+    async def reserve_handshake(self, check_id: str) -> None: await self._reserve(check_id)
+
 
     async def _reserve(self, check_id: str) -> None:
         '''
@@ -112,7 +88,7 @@ class ActiveContext:
             BudgetExceeded: If the budget is exhausted (the request is not sent).
         '''
         await self._reserve(check_id)
-        entry = RequestLogEntry(check_id=check_id, method=method.upper(), url=redact_url(url), note=note)
+        entry: RequestLogEntry = RequestLogEntry(check_id=check_id, method=method.upper(), url=redact_url(url), note=note)
         try:
             resp = await self.client.request(method, url, content=content, headers=headers)
         except BlockedRequestError as exc:
@@ -127,28 +103,18 @@ class ActiveContext:
         self.request_log.append(entry)
         return resp
 
-    def log_probe(self, check_id: str, method: str, target: str, *, status: int | None = None,
-                  note: str | None = None) -> None:
+    def record_external(self, check_id: str, method: str, url: str, *, status: int | None = None, note: str | None = None) -> None:
         '''
-        Record a non-HTTP probe (e.g. a TLS handshake) in the audit log.
-
-        Budget for these is reserved via reserve_handshake; this call only adds the audit entry, so the
-        request log always has one row per reserved request.
+        Record a request a check made through its *own* client (e.g. an external-intelligence provider call
+        to a third-party host), counting it toward the engagement total so the audit log and the reported
+        request count stay in lockstep.
         Parameters:
-            check_id (str): The check that performed the probe.
-            method (str): Short method label (e.g. 'TLS').
-            target (str): What was probed (host:port); shown verbatim.
-            status (int | None): Optional numeric status.
-            note (str | None): Audit note (e.g. the version and outcome).
+            check_id (str): The check that made the request.
+            method (str): HTTP method.
+            url (str): The requested URL (query values are redacted before logging).
+            status (int | None): Response status, if any.
+            note (str | None): Audit note.
         '''
-        self.request_log.append(RequestLogEntry(check_id=check_id, method=method, url=target, status=status, note=note))
-
-    async def reserve_handshake(self, check_id: str) -> None:
-        '''
-        Reserve budget and apply the rate limit before a single non-HTTP probe (e.g. a TLS handshake).
-        Parameters:
-            check_id (str): The check performing the probe.
-        Raises:
-            BudgetExceeded: If the budget is exhausted.
-        '''
-        await self._reserve(check_id)
+        self._total += 1
+        self._per_check[check_id] = self._per_check.get(check_id, 0) + 1
+        self.request_log.append(RequestLogEntry(check_id=check_id, method=method.upper(), url=redact_url(url), status=status, note=note))

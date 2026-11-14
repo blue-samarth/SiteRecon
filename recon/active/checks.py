@@ -1,24 +1,14 @@
-'''
-Active checks. Each is opt-in: it runs only when named in the authorization's ``checks_enabled`` and
-when its required, operator-authored configuration is present. Every request goes through the shared
-``ActiveContext`` so the engagement budget and rate limit apply centrally.
-
-None of these checks send payloads designed to cause side effects, use private/service-role keys, or
-follow redirects. The email rate-limit check additionally refuses to run against any endpoint the
-operator has not explicitly confirmed cannot deliver to a real recipient.
-'''
-
 from __future__ import annotations
 
 import asyncio
-import json
 import ssl
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from typing import ClassVar
 from urllib.parse import urlsplit
 
-from recon.active.authorization import AuthorizationFile, SupabaseTarget
+from recon.active.adapters import Outcome, build_adapter
+from recon.active.authorization import AuthorizationFile
 from recon.active.context import ActiveContext, BudgetExceeded
 from recon.active.models import ActiveCheckResult
 from recon.analysis.findings import LIMITATIONS, RECOMMENDATIONS, lookup_text
@@ -106,98 +96,119 @@ class ActiveCheck(ABC):
                        limitations=lookup_text(LIMITATIONS, code))
 
 
-class SupabaseRlsCheck(ActiveCheck):
+class BackendReadAccessCheck(ActiveCheck):
     '''
-    Checks whether Supabase tables are readable with the public anon key (a row-level-security gap).
+    Checks whether a public, client-side credential can read data it should not — across any backend.
     '''
 
-    check_id: ClassVar[str] = "supabase_rls"
-    description: ClassVar[str] = ("Issues one read-only select per operator-listed table using only the public "
-                                  "anon key; a table that returns rows indicates RLS is not enforced.")
+    check_id: ClassVar[str] = "backend_read_access"
+    description: ClassVar[str] = ("Issues one read-only probe per operator-listed backend resource using only a "
+                                  "public/client-side credential; a resource that returns data indicates "
+                                  "anonymous read access is not restricted.")
 
     def prerequisites(self, auth: AuthorizationFile) -> str | None:
         '''
-        Require a supabase config, an in-scope host and at least one table.
+        Require at least one backend with an in-scope host, resources, and a non-privileged credential.
         Parameters:
             auth (AuthorizationFile): The authorization.
         Returns:
             str | None: Skip reason, or None.
         '''
-        if auth.supabase is None:
-            return "no 'supabase' section in the authorization"
-
-        if not auth.scope.allows(auth.supabase.host):
-            return f"supabase host {auth.supabase.host} is not in scope.hosts"
-
-        if not auth.supabase.tables:
-            return "no table names listed under supabase.tables"
-
-        return None
+        if not auth.backends:
+            return "no 'backends' configured in the authorization"
+        for backend in auth.backends:
+            adapter = build_adapter(backend)
+            if not auth.scope.allows(adapter.host):
+                continue
+            if not adapter.resources():
+                continue
+            if adapter.credential_guard() is not None:
+                continue
+            return None
+        return ("no backend has an in-scope host with resources and a public (non-privileged) credential; "
+                "add the backend's host to scope.hosts and list its resources")
 
     async def run(self, ctx: ActiveContext) -> ActiveCheckResult:
         '''
-        Read one row per listed table with the anon key and flag tables that return data.
+        Probe each in-scope backend's resources and flag any that return data to a public credential.
         Parameters:
             ctx (ActiveContext): Shared context.
         Returns:
-            ActiveCheckResult: One finding per readable table.
+            ActiveCheckResult: One finding per readable resource.
         '''
         started: datetime = datetime.now(UTC)
-        sb: SupabaseTarget|None = ctx.auth.supabase
-        assert sb is not None
-
-        headers: dict[str, str] = {"apikey": sb.anon_key, "Authorization": f"Bearer {sb.anon_key}", "Accept": "application/json"}
         findings: list[Finding] = []
         errors: list[CollectionError] = []
-
         start_count: int = ctx.check_count(self.check_id)
 
-        for table in dict.fromkeys(sb.tables):   # one request per unique table, no pagination
-            url = f"https://{sb.host}/rest/v1/{table}?select=*&limit=1"
-            try:
-                resp = await ctx.request(self.check_id, "GET", url, headers=headers, note=f"supabase RLS probe: {table}")
-
-            except BudgetExceeded as exc:
-                errors.append(CollectionError(module=self.check_id, target=table, error_type="budget_exceeded", message=str(exc)))
+        for backend in ctx.auth.backends:
+            adapter = build_adapter(backend)
+            host: str = adapter.host
+            if not ctx.auth.scope.allows(host):
+                continue
+            guard: str | None = adapter.credential_guard()
+            if guard is not None:
+                errors.append(CollectionError(module=self.check_id, target=f"{adapter.kind}:{host}", error_type="privileged_credential", message=guard))
+                continue
+            if await self._probe_backend(ctx, adapter, findings, errors):
                 break
 
-            if resp is None:
-                errors.append(CollectionError(module=self.check_id, target=table, error_type="request_failed", message="no response"))
-                continue
-
-            rows: int | None = self._rows(resp.body) if resp.status_code == 200 else None
-            if rows:
-                findings.append(self._finding(
-                    "active.supabase_rls_open", f"{sb.host}/{table}",
-                    title=f"Supabase table '{table}' is readable with the public anon key",
-                    description="A select with the anon key returned row data, so row-level security does not "
-                                "restrict anonymous reads of this table. Anyone with the public anon key (shipped "
-                                "in the site's JavaScript) can read it.",
-                    severity=S.HIGH, evidence=[f"GET {redact_url(url)} → HTTP 200, {rows} row(s) returned",
-                                               f"anon key: {redact_secret(sb.anon_key)}"],
-                    source="Supabase PostgREST read with the public anon key",
-                    recommendation="Enable row-level security on this table and add policies that restrict "
-                                   "anonymous access to only what is intended to be public."))
         requests: int = ctx.check_count(self.check_id) - start_count
         status: ModuleStatus = ModuleStatus.PARTIAL if errors else ModuleStatus.SUCCESS
-    
-        return self._result(sb.host, started, status=status, findings=findings, requests=requests, errors=errors)
+        return self._result("backends", started, status=status, findings=findings, requests=requests, errors=errors)
 
-    @staticmethod
-    def _rows(body: bytes) -> int | None:
+    async def _probe_backend(self, ctx: ActiveContext, adapter, findings: list[Finding], errors: list[CollectionError]) -> bool:
         '''
-        Count rows in a PostgREST JSON array response.
+        Probe every resource of one backend, appending findings/errors. Returns True if the budget ran out.
         Parameters:
-            body (bytes): Response body.
+            ctx (ActiveContext): Shared context.
+            adapter (BackendAdapter): The adapter for this backend.
+            findings (list[Finding]): Finding accumulator.
+            errors (list[CollectionError]): Error accumulator.
         Returns:
-            int | None: Row count, or None if the body is not a JSON array.
+            bool: True if the request budget was exhausted (stop the whole check).
         '''
-        try:
-            data = json.loads(body)
-        except (ValueError, UnicodeDecodeError):
-            return None
+        for resource in adapter.resources():
+            probe = adapter.build_probe(resource)
+            target: str = f"{adapter.kind}:{adapter.label(resource)}"
+            try:
+                resp = await ctx.request(self.check_id, probe.method, probe.url, content=probe.content, headers=probe.headers, note=probe.note)
+            except BudgetExceeded as exc:
+                errors.append(CollectionError(module=self.check_id, target=target, error_type="budget_exceeded", message=str(exc)))
+                return True
+            if resp is None:
+                errors.append(CollectionError(module=self.check_id, target=target, error_type="request_failed", message="no response"))
+                continue
+            outcome = adapter.interpret(resource, resp)
+            if outcome.outcome is Outcome.OPEN:
+                findings.append(self._open_finding(adapter, resource, probe, outcome))
+        return False
 
-        return len(data) if isinstance(data, list) else None
+    def _open_finding(self, adapter, resource, probe, outcome) -> Finding:
+        '''
+        Build the high-severity finding for a resource that was readable with a public credential.
+        Parameters:
+            adapter (BackendAdapter): The adapter.
+            resource (Any): The resource that was readable.
+            probe (ProbeRequest): The request that was sent.
+            outcome (ProbeOutcome): The interpreted outcome (carries a detail string).
+        Returns:
+            Finding: The finding.
+        '''
+        label: str = adapter.label(resource)
+        cred: str | None = adapter.credential()
+        cred_line: str = (f"credential: {redact_secret(cred)}" if cred else "credential: none (tested the unauthenticated/open case)")
+        return self._finding(
+            "active.backend_read_access_open", f"{adapter.kind}:{adapter.host}/{label}",
+            title=f"{adapter.kind} resource '{label}' is readable with a public client-side credential",
+            description=(f"A read-only probe of this {adapter.kind} resource returned data using only a "
+                         "public, client-side credential (the kind shipped in a site's JavaScript). Backend "
+                         "authorization — row-level security, database/storage rules, or role permissions — is "
+                         "not restricting anonymous reads, so anyone holding the public credential can read it."),
+            severity=S.HIGH,
+            evidence=[f"backend: {adapter.kind}", f"resource: {label}",
+                      f"{probe.method} {redact_url(probe.url)} → {outcome.detail}", cred_line],
+            source=f"{adapter.kind} read probe with a public client-side credential")
 
 
 class FunctionUrlReachabilityCheck(ActiveCheck):
@@ -305,11 +316,6 @@ class FunctionUrlReachabilityCheck(ActiveCheck):
 class ClientIpHeaderTrustCheck(ActiveCheck):
     '''
     Checks whether an endpoint changes its decision based on client-supplied IP headers.
-
-    Many apps read X-Forwarded-For / X-Real-IP / CF-Connecting-IP for access control, rate limiting or
-    logging. If those client-controllable headers are trusted, an IP allowlist or per-IP rate limit is
-    trivially bypassable. This does NOT forge packets: it sends ordinary requests with those headers set
-    to obvious test values and reports whether the server's response decision changes.
     '''
 
     check_id: ClassVar[str] = "client_ip_header_trust"
@@ -369,8 +375,6 @@ class ClientIpHeaderTrustCheck(ActiveCheck):
                 errors.append(CollectionError(module=self.check_id, target=target.url, error_type="budget_exceeded", message=str(exc)))
                 break
 
-            # If the operator labeled this endpoint access-controlled but the plain baseline already
-            # answered without auth, that is the finding regardless of header behavior (avoids a silent miss).
             if target.access_control and 200 <= baseline.status_code < 400:
                 findings.append(self._finding(
                     "active.access_control_open", redact_url(target.url),
@@ -428,10 +432,6 @@ class ClientIpHeaderTrustCheck(ActiveCheck):
 class EmailEndpointRateLimitCheck(ActiveCheck):
     '''
     Checks whether an operator-opted-in email/notification endpoint rate-limits a small burst.
-
-    This check refuses to run against any endpoint the operator has not explicitly confirmed cannot
-    deliver to a real recipient (``confirmed_no_real_delivery: true``). The burst is hard-capped (≤10)
-    and paced by the engagement rate limit. It is a check that throttling *exists*, not a load test.
     '''
 
     check_id: ClassVar[str] = "email_endpoint_rate_limit"
@@ -478,8 +478,6 @@ class EmailEndpointRateLimitCheck(ActiveCheck):
                 continue
             throttled = any(s in self.THROTTLE_CODES for s in statuses)
             accepted = sum(1 for s in statuses if 200 <= s < 400)
-            # Only conclude "no rate limit" when the full burst actually came back accepted and
-            # unthrottled; a partial sample (transport failures, budget cut-off) is inconclusive.
             full_burst = len(statuses) == target.burst and not hit_budget
             if full_burst and not throttled and accepted == len(statuses):
                 findings.append(self._finding(
@@ -511,7 +509,7 @@ class EmailEndpointRateLimitCheck(ActiveCheck):
         payload = (target.test_payload or '{"siterecon_test": true}').encode("utf-8")
         headers = {"Content-Type": "application/json", "X-SiteRecon-Test": "rate-limit-probe"}
         statuses: list[int] = []
-        for _ in range(target.burst):   # burst is already hard-capped to <=10 by the model
+        for _ in range(target.burst):
             try:
                 resp = await ctx.request(self.check_id, target.method, target.url, content=payload,
                                          headers=headers, note="rate-limit burst (test payload)")
@@ -573,7 +571,6 @@ class TlsProtocolEnumCheck(ActiveCheck):
         hosts = sorted(h for h in ctx.auth.scope.normalized_hosts() if ctx.auth.scope.tls_authorized(h))
         for host in hosts:
             # Record the outcome for EVERY version in order, so the evidence shows what was offered
-            # (and not just what was accepted). Each actual handshake is also written to the audit log.
             outcomes: dict[str, str] = {}
             accepted: dict[str, str] = {}
             for name, version in self.VERSIONS:
@@ -682,8 +679,13 @@ class TlsProtocolEnumCheck(ActiveCheck):
                 pass
 
 
+# Deprecated import alias: the Supabase row-level-security check was reframed as the backend-agnostic
+# BackendReadAccessCheck. Kept so `from recon.active.checks import SupabaseRlsCheck` keeps importing.
+SupabaseRlsCheck = BackendReadAccessCheck
+
+
 REGISTRY: dict[str, type[ActiveCheck]] = {
-    SupabaseRlsCheck.check_id: SupabaseRlsCheck,
+    BackendReadAccessCheck.check_id: BackendReadAccessCheck,
     FunctionUrlReachabilityCheck.check_id: FunctionUrlReachabilityCheck,
     ClientIpHeaderTrustCheck.check_id: ClientIpHeaderTrustCheck,
     EmailEndpointRateLimitCheck.check_id: EmailEndpointRateLimitCheck,

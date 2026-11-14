@@ -1,10 +1,3 @@
-'''
-Analysis layer: turns collected observations into findings and provider inferences.
-
-Nothing in this package performs network I/O. Import from this package, e.g.
-``from recon.analysis import AnalysisEngine, TECH_SIGNATURES``.
-'''
-
 from recon.analysis.engine import (
     DOMAIN_EXPIRY_WARN_DAYS,
     HOLD_STATUSES,
@@ -28,6 +21,7 @@ from recon.analysis.signatures import (
 )
 from recon.analysis.tech_signatures import (
     CERTIFICATE_AUTHORITIES,
+    SIGNATURES_VERSION,
     SPF_SERVICES,
     TECH_SIGNATURES,
     THIRD_PARTY_DOMAINS,
@@ -35,6 +29,14 @@ from recon.analysis.tech_signatures import (
     DomainService,
     TechSignature,
 )
+from recon.analysis.trackers import (
+    PRIVACY_SENSITIVE,
+    TRACKER_SIGNATURES,
+    TrackerCategory,
+    TrackerSignature,
+    classify_tracker,
+)
+from recon.analysis.waf import WAF_SIGNATURES, WafDetection, WafSignature, detect_wafs
 
 __all__ = [
     "AnalysisEngine", "InfrastructureInference", "FindingCollector", "ScanComparator", "ObservationBuilder",
@@ -44,5 +46,7 @@ __all__ = [
     "DNS_PROVIDERS", "HTTP_EDGE_PROVIDERS", "MAIL_PROVIDERS", "NETWORK_PROVIDERS",
     "HeaderSignature", "ProviderSignature",
     "CERTIFICATE_AUTHORITIES", "SPF_SERVICES", "TECH_SIGNATURES", "THIRD_PARTY_DOMAINS",
-    "TXT_VERIFICATIONS", "DomainService", "TechSignature",
+    "TXT_VERIFICATIONS", "DomainService", "TechSignature", "SIGNATURES_VERSION",
+    "PRIVACY_SENSITIVE", "TRACKER_SIGNATURES", "TrackerCategory", "TrackerSignature", "classify_tracker",
+    "WAF_SIGNATURES", "WafDetection", "WafSignature", "detect_wafs",
 ]

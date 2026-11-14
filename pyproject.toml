@@ -10,6 +10,7 @@ dependencies = [
     "dnspython>=2.9.2",
     "httpx[http2]>=0.28.1",
     "idna>=3.20",
+    "maxminddb>=2.6.2",
     "pydantic>=2.14.3",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",

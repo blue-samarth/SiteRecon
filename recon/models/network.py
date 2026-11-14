@@ -37,9 +37,29 @@ class RdapNetwork(BaseModel):
     source_url: str | None = None
 
 
+class GeoLocation(BaseModel):
+    '''
+    Estimated geographic location of an IP, from a local offline geolocation database.
+
+    This is an estimate of where the address is *registered* (ISP/registrant), not where the server
+    physically sits, and it is unreliable behind a CDN/anycast network. ``source`` and ``database_date``
+    identify the database (and carry its required attribution).
+    '''
+    country: str | None = None
+    country_code: str | None = None
+    region: str | None = None
+    city: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    source: str                              # e.g. "DBIP-City-Lite"
+    database_date: str | None = None         # the database's build date (YYYY-MM-DD), for freshness
+    note: str = ("Estimated from an offline geolocation database; reflects the IP's registrant/ISP, not "
+                 "necessarily the physical server, and is unreliable behind a CDN/anycast network.")
+
+
 class IpIntel(BaseModel):
     '''
-    PTR, ASN and RDAP intelligence for one IP address.
+    PTR, ASN, RDAP and (optional) geolocation intelligence for one IP address.
     '''
     ip: str
     version: int
@@ -48,6 +68,7 @@ class IpIntel(BaseModel):
     ptr_status: DnsQueryStatus | None = None
     asn: AsnInfo | None = None
     rdap: RdapNetwork | None = None
+    geo: GeoLocation | None = None
     note: str = (
         "ASN/RDAP data describe who the address space is allocated to (often a CDN or "
         "cloud edge), not necessarily the website's origin server."

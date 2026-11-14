@@ -1,10 +1,3 @@
-'''
-Analysis engine: interprets collected observations into findings and infrastructure.
-
-This module performs no network I/O. Every input is data already gathered by the
-collection layer, which keeps the analysis deterministic and independently testable.
-'''
-
 from __future__ import annotations
 
 import re
@@ -13,6 +6,10 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 from recon.analysis.findings import FindingCollector
+from recon.analysis.tech_signatures import SIGNATURES_VERSION
+from recon.analysis.trackers import PRIVACY_SENSITIVE, TrackerCategory, classify_tracker
+from recon.analysis.waf import detect_wafs
+from recon.utils import registrable_domain
 from recon.analysis.signatures import (
     DNS_PROVIDERS,
     HTTP_EDGE_PROVIDERS,
@@ -37,6 +34,7 @@ from recon.models import (
     Severity,
     SpfAnalysis,
     SubdomainData,
+    ThirdPartyData,
     TlsData,
     CookieData,
     CrawlData,
@@ -58,26 +56,60 @@ _VERSIONED_SERVER: re.Pattern[str] = re.compile(r"[a-z][\w.-]*/\d+(?:\.\d+)+", r
 S, C = Severity, Confidence  # enum aliases for brevity
 
 
+def _is_absolute_url(value: str) -> bool:
+    '''
+    Whether a value is an absolute http(s) URL (as Open Graph requires for og:image/og:url).
+    Parameters:
+        value (str): The URL value to test.
+    Returns:
+        bool: True if it has an http/https scheme and a host.
+    '''
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+def _registrable_offsite(page_url: str, canonical: str) -> bool:
+    '''
+    Whether a canonical URL points to a different registrable domain than the page.
+
+    A relative canonical (no host) is same-site by definition. When either registrable domain cannot be
+    determined, this returns False so an uncertain case never produces a finding.
+    Parameters:
+        page_url (str): The page's own URL.
+        canonical (str): The rel=canonical value.
+    Returns:
+        bool: True only when both registrable domains are known and differ.
+    '''
+    try:
+        canon_host = urlsplit(canonical.strip()).hostname
+        page_host = urlsplit(page_url).hostname
+    except ValueError:
+        return False
+    if not canon_host or not page_host:
+        return False
+    canon_reg = registrable_domain(canon_host.lower())
+    page_reg = registrable_domain(page_host.lower())
+    return bool(canon_reg) and bool(page_reg) and canon_reg != page_reg
+
+
 class AnalysisEngine:
     '''
     Interprets collected observations into findings, inferred infrastructure and severity counts.
     Stateless apart from the timestamp stamped on every finding; performs no network I/O.
     '''
 
-    def __init__(self, timestamp: datetime) -> None:
-        '''
-        Create an engine.
-        Parameters:
-            timestamp (datetime): The timestamp of the analysis, stamped on every finding.
-        '''
-        self.timestamp = timestamp
+    def __init__(self, timestamp: datetime) -> None: self.timestamp = timestamp
 
     def analyze(self, *, dns: DnsData | None, network: NetworkData | None, http: HttpData | None,
-                tls: TlsData | None, whois: DomainRegistration | None = None,
+                tls: TlsData | None, host: str | None = None, whois: DomainRegistration | None = None,
                 html: HtmlData | None = None, subdomains: SubdomainData | None = None,
                 dnssec: DnssecData | None = None, resources: ResourcesData | None = None,
                 crawl: CrawlData | None = None, cookies: CookieData | None = None,
-                assets: AssetData | None = None, observations: list[Observation] | None = None,
+                assets: AssetData | None = None, third_party: ThirdPartyData | None = None,
+                observations: list[Observation] | None = None,
                 ) -> AnalysisResult:
         '''
         Analyze the results of various probes and produce a structured report of findings and inferred infrastructure.
@@ -88,6 +120,7 @@ class AnalysisEngine:
             network (NetworkData | None): Network probe results.
             http (HttpData | None): HTTP probe results.
             tls (TlsData | None): TLS probe results.
+            host (str | None): Target hostname, used as the subject of host-level findings (e.g. hosting location).
             whois (DomainRegistration | None): Domain registration information.
             html (HtmlData | None): HTML probe results.
             subdomains (SubdomainData | None): Subdomain probe results.
@@ -96,6 +129,7 @@ class AnalysisEngine:
             crawl (CrawlData | None): Crawl results.
             cookies (CookieData | None): Cookie attribute results.
             assets (AssetData | None): Static JS/CSS asset analysis.
+            third_party (ThirdPartyData | None): Third-party service inventory (classified into trackers).
             observations (list[Observation] | None): Normalized observations used as evidence references.
         Returns:
             AnalysisResult: A structured report containing findings, inferred infrastructure, and severity counts.
@@ -103,15 +137,21 @@ class AnalysisEngine:
         findings: FindingCollector = FindingCollector(self.timestamp)
         if dns: self._analyze_dns(dns, findings)
         if http: self._analyze_http(http, findings)
+        if http: self._analyze_waf(http, cookies, findings)
         if tls: self._analyze_tls(tls, findings)
         if whois: self._analyze_whois(whois, findings)
-        if html: self._analyze_html(html, findings)
+        if html:
+            self._analyze_html(html, findings)
+            self._analyze_seo(html, findings)
+            self._analyze_open_graph(html, findings)
         if subdomains: self._analyze_subdomains(subdomains, findings)
         if dnssec: self._analyze_dnssec(dnssec, whois, findings)
         if resources: self._analyze_resources(resources, findings)
         if crawl: self._analyze_crawl(crawl, http, findings)
         if cookies: self._analyze_cookies(cookies, findings)
         if assets: self._analyze_assets(assets, findings)
+        if third_party: self._analyze_trackers(third_party, html, findings)
+        if network: self._analyze_hosting(network, host, findings)
         if observations: findings.link(observations)
 
         infrastructure: list[InfrastructureObservation] = InfrastructureInference.infer(
@@ -498,6 +538,208 @@ class AnalysisEngine:
                               "trust, not a vulnerability. Assets that do declare integrity are hash-verified "
                               "when this scan downloaded them.",
                   severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=no_sri[:15], source=source)
+
+    @staticmethod
+    def _analyze_seo(html: HtmlData, f: FindingCollector) -> None:
+        '''
+        Flag missing or conflicting SEO metadata on the landing page (quality signals, not vulnerabilities).
+        Parameters:
+            html (HtmlData): Parsed landing-page HTML.
+            f (FindingCollector): Collector to which findings will be added.
+        '''
+        page = html.source_url
+        source = f"HTML {page}"
+        if not html.title:
+            f.add("seo.title_missing", page, category="seo", title="Page has no <title>",
+                  description="The landing page has no <title> element. Search engines, browser tabs and "
+                              "shared links rely on it; its absence usually points to a template or rendering problem.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"no <title> on {page}"], source=source)
+        if not html.meta_description:
+            f.add("seo.meta_description_missing", page, category="seo", title="Page has no meta description",
+                  description="There is no <meta name=\"description\">. Search engines will synthesize a snippet "
+                              "from arbitrary page text instead of a chosen summary.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"no meta description on {page}"], source=source)
+        if "noindex" in (html.robots or "").lower():
+            f.add("seo.noindex", page, category="seo", title="Landing page asks search engines not to index it",
+                  description="The robots meta directive contains 'noindex', so compliant search engines will not "
+                              "list this page. On a production landing page this is frequently unintended — e.g. a "
+                              "staging configuration shipped to production.",
+                  severity=S.LOW, confidence=C.HIGH, evidence=[f'robots meta: "{html.robots}"'], source=source)
+        if html.canonical and _registrable_offsite(page, html.canonical):
+            f.add("seo.canonical_offsite", page, category="seo", title="Canonical URL points to another domain",
+                  description="The rel=canonical link names a different registrable domain than the page itself, "
+                              "telling search engines a different site is the original. This can be legitimate "
+                              "(syndication) but is also a symptom of canonical hijacking or a template/copy-paste error.",
+                  severity=S.LOW, confidence=C.MEDIUM,
+                  evidence=[f"page: {page}", f"canonical: {html.canonical}"], source=source)
+
+    @staticmethod
+    def _analyze_open_graph(html: HtmlData, f: FindingCollector) -> None:
+        '''
+        Flag missing, incomplete or malformed Open Graph / Twitter social-card metadata on the landing page.
+        Parameters:
+            html (HtmlData): Parsed landing-page HTML.
+            f (FindingCollector): Collector to which findings will be added.
+        '''
+        page = html.source_url
+        source = f"HTML {page}"
+        og = html.open_graph
+        if not og:
+            f.add("og.missing", page, category="social", title="No Open Graph metadata",
+                  description="The page has no Open Graph (og:*) tags, so links shared to social platforms and "
+                              "chat apps get no controlled title, description or preview image.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"no og:* meta on {page}"], source=source)
+            return
+        missing = [k for k in ("og:title", "og:type", "og:image", "og:url") if k not in og]
+        if missing:
+            f.add("og.incomplete", page, category="social", title="Incomplete Open Graph metadata",
+                  description="Open Graph tags are present but missing core properties, so social previews can "
+                              "render inconsistently or incompletely across platforms.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"present: {sorted(og)}", f"missing: {missing}"], source=source)
+        malformed = [k for k in ("og:image", "og:url") if k in og and not _is_absolute_url(og[k])]
+        if malformed:
+            f.add("og.malformed", page, category="social", title="Open Graph URL properties are not absolute",
+                  description="og:image and og:url must be absolute http(s) URLs; most crawlers ignore relative or "
+                              "protocol-relative values, so the preview image or canonical link will not resolve.",
+                  severity=S.LOW, confidence=C.HIGH,
+                  evidence=[f"{k} = {og[k]!r}" for k in malformed], source=source)
+        if html.open_graph and "twitter:card" not in html.twitter:
+            f.add("twitter.card_missing", page, category="social", title="No Twitter/X card type",
+                  description="Open Graph is present but there is no twitter:card tag, so X/Twitter may fall back "
+                              "to a basic preview or none at all.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"twitter keys: {sorted(html.twitter)}"], source=source)
+
+    @staticmethod
+    def _analyze_hosting(network: NetworkData, host: str | None, f: FindingCollector) -> None:
+        '''
+        Estimate where the target's resolved IPs are hosted, from ASN/RDAP allocation and (if available) an
+        offline city database.
+
+        Parameters:
+            network (NetworkData): Per-IP intelligence.
+            host (str | None): Target hostname (the finding subject); falls back to the first IP.
+            f (FindingCollector): Collector to which the finding will be added.
+        '''
+        public: list[IpInfo] = [ip for ip in network.ips if ip.is_public]
+        if not public: return
+        lines: list[str] = []
+        attribution: str | None = None
+        for ip in public:
+            text = " ".join(filter(None, [
+                ip.asn.name if ip.asn else None, ip.rdap.name if ip.rdap else None,
+                *(ip.rdap.organizations if ip.rdap else [])]))
+            provider = next((s for s in NETWORK_PROVIDERS if text and s.match_text(text)), None)
+            if provider is not None and provider.category == "cdn":
+                lines.append(f"{ip.ip}: {provider.provider} (CDN/anycast — hosting location not meaningful)")
+                continue
+            country = ((ip.geo.country_code or ip.geo.country) if ip.geo else None) \
+                or (ip.rdap.country if ip.rdap else None) or (ip.asn.country if ip.asn else None)
+            org = (ip.rdap.organizations[0] if ip.rdap and ip.rdap.organizations else None) \
+                or (ip.asn.name if ip.asn else None)
+            parts = [f"country {country}" if country else "country unknown"]
+            if org:
+                parts.append(f"org {org}")
+            if ip.geo and ip.geo.city:
+                city = ", ".join(filter(None, [ip.geo.city, ip.geo.region]))
+                parts.append(f"city ~{city} [{ip.geo.source} {ip.geo.database_date or ''}]".strip())
+                attribution = ip.geo.source
+            lines.append(f"{ip.ip}: " + ", ".join(parts))
+        if attribution:
+            lines.append(f"city-level data: {attribution} (offline database; attribution required by its licence)")
+        description = ("Estimated hosting location of the target's resolved IPs, from ASN/RDAP allocation data"
+                       + (" and an offline city database" if attribution else "")
+                       + ". This is an estimate of where the address space is registered, not the physical "
+                         "server; an address behind a CDN/anycast network has no single meaningful location.")
+        f.add("hosting.location", host or public[0].ip, category="hosting", title="Hosting location (estimated)",
+              description=description, severity=S.INFORMATIONAL, confidence=C.MEDIUM, evidence=lines[:20],
+              source="ASN/RDAP allocation" + (" and offline geolocation database" if attribution else ""))
+
+    @staticmethod
+    def _analyze_waf(http: HttpData, cookies: CookieData | None, f: FindingCollector) -> None:
+        '''
+        Identify any WAF/edge-security provider from the primary probe's headers, banner and cookies.
+
+        Informational intelligence, not a vulnerability. No finding is produced when nothing matches —
+        absence of a signature is never reported as "no WAF", since many WAFs leave no trace on a 200.
+        Parameters:
+            http (HttpData): HTTP probe results.
+            cookies (CookieData | None): Cookie attribute results (names only are used).
+            f (FindingCollector): Collector to which findings will be added.
+        '''
+        probe = (next((p for p in http.probes if p.final_fetched and (p.final_url or "").startswith("https://")), None) or next((p for p in http.probes if p.success), None))
+        if probe is None:
+            return
+        cookie_names = [c.name for c in cookies.cookies] if cookies else []
+        detections = detect_wafs(probe.headers, cookie_names, probe.server)
+        if not detections:
+            return
+        subject = urlsplit(probe.final_url or probe.requested_url).hostname or probe.requested_url
+        confidence = max((d.confidence for d in detections), key=lambda c: c.rank)
+        evidence = [f"signature DB version: {SIGNATURES_VERSION}"]
+        for d in detections:
+            note = f" — {d.note}" if d.note else ""
+            evidence.append(f"{d.vendor} ({d.confidence.value}){note}: {'; '.join(d.evidence)}")
+        vendors = ", ".join(d.vendor for d in detections)
+        title = (f"Web Application Firewall detected: {detections[0].vendor}" if len(detections) == 1
+                 else f"Web Application Firewall(s) detected: {vendors}")
+        f.add("waf.detected", subject, category="waf", title=title,
+              description="A WAF / edge-security provider was identified from response headers, the server "
+                          "banner or cookies — informational intelligence about the target's defenses. Absence "
+                          "of a signature is NOT proof there is no WAF (many are invisible on a normal response), "
+                          "and a CDN/proxy signal shows the platform is WAF-capable, not that rules are enabled.",
+              severity=S.INFORMATIONAL, confidence=confidence, evidence=evidence[:20],
+              source="HTTP response headers, server banner and cookies")
+
+    @staticmethod
+    def _analyze_trackers(third_party: ThirdPartyData, html: HtmlData | None, f: FindingCollector) -> None:
+        '''
+        Classify the third-party inventory into trackers by purpose and inventory them.
+        Parameters:
+            third_party (ThirdPartyData): The third-party service inventory.
+            html (HtmlData | None): Landing-page HTML, used only to name the finding subject.
+            f (FindingCollector): Collector to which findings will be added.
+        '''
+        found: dict[str, dict] = {}
+        for service in third_party.services:
+            for domain in service.domains:
+                sig = classify_tracker(domain)
+                if sig is None:
+                    continue
+                rec = found.setdefault(sig.provider, {"category": sig.category, "domains": set(), "sources": set()})
+                rec["domains"].add(domain)
+                rec["sources"].update(service.sources)
+        if not found:
+            return
+
+        subject = (urlsplit(html.source_url).hostname if html and html.source_url else None) or "trackers"
+        by_category: Counter[TrackerCategory] = Counter(rec["category"] for rec in found.values())
+        summary = ", ".join(f"{cat.value}: {n}" for cat, n in sorted(by_category.items(), key=lambda kv: kv[0].value))
+        lines: list[str] = [f"signature DB version: {SIGNATURES_VERSION}",
+                            f"{len(found)} tracker(s) — {summary}"]
+        for provider, rec in sorted(found.items(), key=lambda kv: (kv[1]["category"].value, kv[0])):
+            doms = ", ".join(sorted(rec["domains"])[:3])
+            srcs = ", ".join(sorted(rec["sources"])[:2]) or "referenced"
+            lines.append(f"{rec['category'].value}: {provider} — {doms} (via {srcs})")
+        f.add("trackers.detected", subject, category="trackers", title="Third-party trackers in use",
+              description="The site loads third-party services that track visitors, classified here by purpose "
+                          "(analytics, tag manager, A/B testing, consent, CDP, social, advertising, session "
+                          "replay, fingerprinting). This is an inventory for privacy/consent review, not a "
+                          "vulnerability; confirm each is disclosed and consented to as your jurisdiction requires.",
+              severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=lines[:25], source="third-party inventory")
+
+        sensitive = sorted(p for p, rec in found.items() if rec["category"] in PRIVACY_SENSITIVE
+                           and rec["category"] is TrackerCategory.SESSION_REPLAY)
+        if sensitive:
+            f.add("trackers.session_replay", subject, category="trackers",
+                  title="Session-replay/heatmap trackers present",
+                  description="These trackers record user sessions — mouse movement, clicks, scrolling and "
+                              "sometimes keystrokes and form input. They capture potentially sensitive personal "
+                              "data and in most jurisdictions require explicit prior consent and input masking.",
+                  severity=S.LOW, confidence=C.HIGH,
+                  evidence=[f"session-replay providers: {', '.join(sensitive)}",
+                            f"signature DB version: {SIGNATURES_VERSION}"], source="third-party inventory")
 
     @staticmethod
     def _analyze_subdomains(data: SubdomainData, f: FindingCollector) -> None:

@@ -22,7 +22,10 @@ from recon.active import (
     ActiveReport,
     AuthorizationError,
     AuthorizationFile,
+    apply_synthesis,
+    build_authorization_draft,
     load_authorization,
+    synthesize,
 )
 from recon.active.inventory import Inventory, build_inventory, read_inventory, write_inventory
 from recon.analysis import ScanComparator
@@ -114,6 +117,10 @@ def scan(
     allow_private_networks: Annotated[bool, typer.Option(
         "--allow-private-networks",
         help="Permit requests to private/loopback addresses (authorized internal assessments only).")] = False,
+    geoip_db: Annotated[Path | None, typer.Option(
+        "--geoip-db", envvar="SITERECON_GEOIP_DB",
+        help="Offline city database (e.g. free DB-IP IP-to-City Lite .mmdb) for city-level hosting "
+             "location. Without it, hosting location falls back to the ASN/RDAP country estimate.")] = None,
 ) -> None:
     '''
     Passive reconnaissance of a domain you own or are authorized to assess.
@@ -161,7 +168,7 @@ def scan(
         allow_private_networks=allow_private_networks, probe_subdomains=probe_subdomains,
         max_subdomains=max_subdomains, whois=whois, modules=selected, crawl=crawl, crawl_depth=depth,
         max_pages=max_pages, crawl_delay=crawl_delay, respect_robots=not ignore_robots, history=history,
-        max_assets=max_assets, asset_hosts=asset_hosts,
+        max_assets=max_assets, asset_hosts=asset_hosts, geoip_db=geoip_db,
     )
     console.print(f"[bold]Scanning[/bold] {hostname} [dim](passive; authorized targets only)[/dim]")
     with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
@@ -191,6 +198,57 @@ def scan(
     ran = [m for m in report.module_results().values() if m.status is not ModuleStatus.SKIPPED]
     if ran and all(m.status is ModuleStatus.FAILED for m in ran):
         raise typer.Exit(1)
+
+
+@app.command(name="scaffold-auth",
+             help="Scaffold a DRAFT active-testing authorization from a passive scan (nothing is enabled).")
+def scaffold_auth(
+    domain: Annotated[str, typer.Argument(help="Target domain or URL (must be authorized).")],
+    output: Annotated[Path, typer.Option("--output", "-o", help="Report directory.")] = Path("reports"),
+    crawl: Annotated[bool, typer.Option("--crawl", help="Crawl in-scope pages to discover more candidates.")] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Detailed execution logs.")] = False,
+) -> None:
+    '''
+    Discover active-testing candidates passively and write a DRAFT authorization for the operator to review.
+
+    The draft lists discovered backends and endpoints but enables nothing (checks_enabled is empty) and
+    leaves the human-only safety labels blank, so it is inert until reviewed and completed by hand.
+    Parameters:
+        domain (str): Target domain or URL.
+        output (Path): Base report directory; the draft goes to <output>/<hostname>/active/.
+        crawl (bool): Crawl in-scope pages to discover more candidate endpoints.
+        verbose (bool): Enable detailed execution logs.
+    Raises:
+        typer.Exit: Code 2 for invalid input.
+    '''
+    setup_logging(verbose)
+    try:
+        hostname = normalize_target(domain)
+    except InvalidTargetError as exc:
+        console.print(f"[red]Invalid target:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    config = Config(target_input=domain, hostname=hostname, output_dir=output, crawl=crawl, verbose=verbose,
+                    history=False)
+    console.print(f"[bold]Scaffolding authorization[/bold] for {hostname} "
+                  "[dim](passive recon; discovers candidates, runs no active checks)[/dim]")
+    with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
+        report = asyncio.run(ScanOrchestrator(config).run(progress=advance))
+
+    draft = build_authorization_draft(report)
+    active_dir = output / hostname / "active"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    path = active_dir / "authorization.draft.yaml"
+    path.write_text(draft, encoding="utf-8")
+    try:
+        load_authorization(path)   # sanity: the inert draft must still parse
+    except AuthorizationError as exc:
+        console.print(f"[yellow]Note:[/yellow] the draft needs edits before it will load: {exc}")
+
+    console.print(f"\n[bold]Draft authorization[/bold] → {path}")
+    console.print("  [yellow]Nothing is enabled.[/yellow] [dim]Review it, confirm you are authorized for every "
+                  "host,\n  fill the blanks (anon keys, resources, state_changing), then add checks to "
+                  "checks_enabled.[/dim]")
+    console.print(f"  [dim]Preview:[/dim] siterecon active {hostname} --authorization {path} --dry-run")
 
 
 @app.command(name="history", help="List stored scans of a target.")
@@ -273,6 +331,15 @@ def active_cmd(
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Resolve and print what would run; make no requests.")] = False,
     passive: Annotated[bool, typer.Option("--passive/--no-passive",
                                           help="Run a passive recon scan first to build an inventory.")] = True,
+    fail_on: Annotated[Severity | None, typer.Option("--fail-on",
+                                                     help="Exit non-zero (code 3) if any finding is at least "
+                                                          "this severity. For CI gating.")] = None,
+    bypass_sec: Annotated[bool, typer.Option("--bypass-sec",
+                                             help="LOCAL ONLY. With auto_discover, run the COMPLETE check set "
+                                                  "(except email) on your first-party hosts and the backends "
+                                                  "your site embeds — including backend reads with the "
+                                                  "discovered public key. Never probes unrelated third-party "
+                                                  "hosts; never bursts email.")] = False,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Detailed execution logs.")] = False,
     now: Annotated[str | None, typer.Option("--now", hidden=True, help="Reference time (ISO 8601) for the window check.")] = None,
 ) -> None:
@@ -319,6 +386,11 @@ def active_cmd(
                       f"authorization target '{auth_host}'. Refusing to run.")
         raise typer.Exit(2)
 
+    if bypass_sec and auth.auto_discover is None:
+        console.print("[red]--bypass-sec requires an auto_discover authorization[/red] (it needs the "
+                      "authorized_domains boundary). Add an auto_discover block to the authorization.")
+        raise typer.Exit(2)
+
     orchestrator = ActiveOrchestrator(auth, now=moment)
     if dry_run:
         _print_active_plan(orchestrator, auth, moment)
@@ -331,13 +403,17 @@ def active_cmd(
 
     console.print(f"[bold red]ACTIVE testing[/bold red] {hostname} "
                   f"[dim](authorized; may affect the target)[/dim]")
+    if bypass_sec:
+        console.print("[bold red]--bypass-sec:[/bold red] complete check set (except email) on first-party "
+                      "hosts and your embedded backends, including backend reads with the discovered public key. "
+                      "[dim]Local testing only.[/dim]")
 
     active_dir = output / hostname / "active"
     inventory: Inventory | None = None
     if passive:
         console.print("\n[bold]Step 1 — passive recon[/bold] [dim](building inventory)[/dim]")
         pconfig = Config(target_input=domain, hostname=hostname, output_dir=output, output_format=output_format,
-                         crawl=True, history=False, verbose=verbose)
+                         crawl=True, history=False, verbose=verbose, retain_client_keys=bypass_sec)
         with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
             passive_report = asyncio.run(ScanOrchestrator(pconfig).run(progress=advance))
         p_writers: list[ReportWriter] = [JsonReportWriter(passive_report)]
@@ -348,6 +424,13 @@ def active_cmd(
         for w in p_writers:
             w.write(output / hostname)
         TerminalSummary(console).print(passive_report)
+        # Feed the resolved public IPs to the active run so the external-intelligence phase (if authorized)
+        # can query IP-keyed providers; it queries third parties, so no target traffic depends on this.
+        net = passive_report.network.data
+        orchestrator.ips = [ip.ip for ip in net.ips if ip.is_public] if net else []
+        if auth.auto_discover is not None:
+            auth, orchestrator = _apply_auto_discover(auth, passive_report, moment, orchestrator.ips,
+                                                      complete=bypass_sec)
         inventory = build_inventory(passive_report)
         inv_path = write_inventory(inventory, active_dir)
         inventory = read_inventory(active_dir) or inventory
@@ -392,6 +475,41 @@ def active_cmd(
         console.print(f"  {path}")
     if report.checks and all(c.status is ModuleStatus.FAILED for c in report.checks):
         raise typer.Exit(1)
+    if fail_on is not None:
+        gating = [f for f in report.findings() if f.severity.rank >= fail_on.rank]
+        if gating:
+            worst = max((f.severity for f in gating), key=lambda s: s.rank)
+            console.print(f"\n[red]Gate failed:[/red] {len(gating)} finding(s) at or above "
+                          f"[bold]{fail_on.value}[/bold] (worst: {worst.value}).")
+            raise typer.Exit(3)
+
+
+def _apply_auto_discover(auth: AuthorizationFile, passive_report: ReconReport, moment: datetime,
+                         ips: list[str], *, complete: bool = False) -> tuple[AuthorizationFile, ActiveOrchestrator]:
+    '''
+    Synthesize first-party targets from the passive scan and rebuild the orchestrator on the effective auth.
+    Parameters:
+        auth (AuthorizationFile): The committed authorization (with auto_discover).
+        passive_report (ReconReport): The passive scan report.
+        moment (datetime): Reference time for the window check.
+        ips (list[str]): Resolved public IPs for the external-intelligence phase.
+        complete (bool): Run the complete check set (local --bypass-sec): embedded backends and IP-trust too.
+    Returns:
+        tuple[AuthorizationFile, ActiveOrchestrator]: The effective authorization and its orchestrator.
+    '''
+    assert auth.auto_discover is not None
+    synthesis = synthesize(auth.auto_discover, target=auth.target, report=passive_report, complete=complete)
+    effective = apply_synthesis(auth, synthesis)
+    console.print("  [green]Auto-discover[/green] "
+                  f"[dim]→ {len(synthesis.function_urls)} first-party endpoint(s), "
+                  f"{len(synthesis.tls_hosts)} TLS host(s), {len(synthesis.backends)} embedded backend(s); "
+                  f"checks: {', '.join(synthesis.checks) or '(none)'}[/dim]")
+    if synthesis.third_party_hosts:
+        console.print(f"  [dim]third-party hosts discovered but NOT tested: "
+                      f"{', '.join(synthesis.third_party_hosts[:8])}"
+                      f"{' …' if len(synthesis.third_party_hosts) > 8 else ''}[/dim]")
+    orchestrator = ActiveOrchestrator(effective, now=moment, ips=ips)
+    return effective, orchestrator
 
 
 def _warn_uninventoried(auth: AuthorizationFile, inventory: Inventory) -> None:
@@ -419,8 +537,12 @@ def _warn_uninventoried(auth: AuthorizationFile, inventory: Inventory) -> None:
     for url in endpoints:
         if (urlsplit(url).path.rstrip("/") or "/") != "/" and key(url) not in discovered:
             warnings.append(f"{redact_url(url)} — path not seen in the passive crawl/sitemap")
-    if auth.supabase and auth.supabase.host.lower() not in hosts:
-        warnings.append(f"{auth.supabase.host} — Supabase host not seen in the passive inventory")
+    from recon.active.adapters import build_adapter
+
+    for backend in auth.backends:
+        host = build_adapter(backend).host
+        if host and host.lower() not in hosts:
+            warnings.append(f"{host} — {backend.kind} backend host not seen in the passive inventory")
     if warnings:
         console.print("[yellow]Note — authorized active targets the passive scan did not discover "
                       "(operator-listed, tested anyway):[/yellow]")
@@ -444,6 +566,11 @@ def _print_active_plan(orchestrator: ActiveOrchestrator, auth: AuthorizationFile
     console.print(f"  Scope hosts: {', '.join(opts['scope_hosts']) or '(none)'}")
     console.print(f"  Rate limit: {opts['rate_limit_rps']} rps · budget {opts['max_requests']} "
                   f"(per check {opts['max_requests_per_check']})")
+    if auth.auto_discover is not None:
+        console.print("  [green]Auto-discover enabled[/green] [dim]— a passive scan will synthesize first-party "
+                      f"targets under {', '.join(auth.auto_discover.authorized_domains)} and run the safe "
+                      f"checks ({', '.join(auth.auto_discover.checks) or 'default safe set'}). "
+                      "Third-party hosts are never tested.[/dim]")
     table = Table(title="Checks", title_justify="left")
     for col in ("Check", "Would run?", "Reason"):
         table.add_column(col)

@@ -1,8 +1,3 @@
-'''
-Finding construction: stable deduplicated identifiers, recommendations, limitations and
-evidence references to the observations that support each finding.
-'''
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -57,6 +52,22 @@ RECOMMENDATIONS: dict[str, str] = {
     "html.mixed_": "Serve all subresources over HTTPS.",
     "html.insecure_form_action": "Submit forms only to HTTPS endpoints.",
     "html.third_party_script_no_sri": "Add integrity attributes to static third-party files where feasible.",
+    "seo.title_missing": "Add a descriptive <title> element to the page.",
+    "seo.meta_description_missing": "Add a concise <meta name=\"description\"> summarizing the page.",
+    "seo.noindex": "If this page should be discoverable, remove 'noindex' from its robots directive; confirm a staging setting was not shipped to production.",
+    "seo.canonical_offsite": "Confirm the canonical URL intentionally points to another domain; otherwise correct it to this page's own canonical URL.",
+    "og.missing": "Add Open Graph tags (og:title, og:type, og:image, og:url) so shared links render a controlled preview.",
+    "og.incomplete": "Add the missing core Open Graph properties (og:title, og:type, og:image, og:url).",
+    "og.malformed": "Use absolute http(s) URLs for og:image and og:url.",
+    "twitter.card_missing": "Add a twitter:card tag (e.g. summary_large_image) to control the X/Twitter preview.",
+    "waf.detected": "No action required; confirm the WAF runs in blocking (not monitor-only) mode, covers every origin and subdomain, and that the origin cannot be reached directly to bypass it.",
+    "hosting.location": "No action required; verify the hosting region and provider match your data-residency and compliance requirements.",
+    "intel.archived_history": "Review archived snapshots for endpoints or data that should not be public; remove anything sensitive from the live site and request removal from the archive where warranted.",
+    "intel.archived_sensitive_path": "Verify whether each archived sensitive path is still reachable; if a backup/config/secret file was ever public, treat it as exposed and rotate the affected credentials.",
+    "intel.exposed_ports": "Confirm each indexed port should be internet-facing; firewall or close those that should not be, and verify the IP serves only intended hosts.",
+    "intel.indexed_vulnerability": "Verify each CVE against the actually deployed software version before acting; version-based matches include false positives.",
+    "trackers.detected": "Review each third-party tracker against your privacy policy and consent banner; ensure non-essential trackers load only after consent.",
+    "trackers.session_replay": "Confirm session-replay tools have explicit prior consent and mask sensitive fields (passwords, payment and personal data); disable recording where consent is absent.",
     "crawl.password_over_http": "Serve login forms only over HTTPS.",
     "cookies.missing_secure": "Set the Secure attribute on cookies issued over HTTPS.",
     "cookies.missing_httponly": "Set HttpOnly on cookies that scripts do not need to read.",
@@ -67,6 +78,9 @@ RECOMMENDATIONS: dict[str, str] = {
     "resources.security_txt_incomplete": "Add the required Contact and Expires fields to security.txt.",
     "subdomains.private_address": "Avoid publishing internal addresses in public DNS where possible.",
     # active checks
+    "active.backend_read_access_open": "Enforce server-side authorization (row-level security, database/storage "
+                                       "rules, or role permissions) so this resource cannot be read with a public, "
+                                       "client-side credential; expose only what is intended to be public.",
     "active.supabase_rls_open": "Enable row-level security on the table and add policies restricting anonymous "
                                 "access to only what is intended to be public.",
     "active.endpoint_open": "Require authentication/authorization on this endpoint, or confirm it is intended to "
@@ -88,7 +102,6 @@ RECOMMENDATIONS: dict[str, str] = {
     "js.client_config": "Public client keys are expected; ensure backend authorization (database/storage rules, row-level security) does not depend on them staying secret.",
 }
 
-# Known limits on what a finding can prove.
 LIMITATIONS: dict[str, str] = {
     "dns.caa_absent": "Only the hostname and its parents up to the registrable domain were checked.",
     "dns.spf_missing": "Relevant only if the domain sends email.",
@@ -105,14 +118,22 @@ LIMITATIONS: dict[str, str] = {
     "html.third_party_script_no_sri": "Presence of the attribute is checked for every referenced script; hash verification is performed only for assets the scan downloaded (in-scope plus --asset-host).",
     "js.exposed_secret": "Heuristic pattern match on downloaded in-scope bundles; raw values are not stored, so each must be confirmed manually. False positives are possible.",
     "js.client_config": "Public client configuration is not a vulnerability by itself.",
+    "seo.": "Observed on the fetched landing page only; other pages and server-rendered variants may differ.",
+    "og.": "Observed on the fetched landing page only; social previews also depend on each platform's own crawler.",
+    "twitter.": "Observed on the fetched landing page only; the preview also depends on X/Twitter's own crawler.",
+    "trackers.": "Classified from referenced third-party domains against a versioned signature set; coverage is not exhaustive and a tracker loaded only after consent or user action may not appear.",
+    "waf.": "Passive identification from headers, cookies and the server banner only; absence of a signature does not prove there is no WAF, and a CDN/proxy signal does not prove WAF rules are enabled.",
+    "hosting.": "An estimate from registry allocation and an optional offline geo database; it reflects where the address space is registered, not the physical server, and is not meaningful behind a CDN/anycast network.",
+    "intel.": "Retrieved from a third-party provider; it reflects that provider's data about the IP/domain — which may be historical or stale — not a live observation by SiteRecon, and discloses the target to that provider.",
 }
 
-# Finding category → modules whose observations can serve as evidence.
 _CATEGORY_MODULES: dict[str, tuple[str, ...]] = {
     "dns": ("dns",), "email": ("dns",), "dnssec": ("dnssec", "whois"), "http": ("http", "crawler"),
     "tls": ("tls",), "registration": ("whois",), "html": ("html", "crawler"), "crawl": ("crawler",),
     "cookies": ("cookies",), "resources": ("resources",), "subdomains": ("subdomains",),
-    "javascript": ("javascript",),
+    "javascript": ("javascript",), "seo": ("html",), "social": ("html",),
+    "trackers": ("third_party", "javascript", "html"), "waf": ("http", "cookies"),
+    "hosting": ("network",), "intel": ("wayback", "shodan_internetdb"),
 }
 
 
@@ -131,7 +152,7 @@ def lookup_text(table: dict[str, str], code: str) -> str | None:
     return table[max(prefixes, key=len)] if prefixes else None
 
 
-_lookup = lookup_text   # backwards-compatible alias used within this module
+_lookup = lookup_text
 
 
 class FindingCollector:
@@ -148,19 +169,7 @@ class FindingCollector:
         self.timestamp = timestamp
         self._items: dict[str, Finding] = {}
 
-    def add(
-        self,
-        code: str,
-        subject: str,
-        *,
-        category: str,
-        title: str,
-        description: str,
-        severity: Severity,
-        confidence: Confidence,
-        evidence: list[str],
-        source: str,
-    ) -> None:
+    def add(self, code: str, subject: str, *, category: str, title: str, description: str, severity: Severity, confidence: Confidence, evidence: list[str], source: str, ) -> None:
         '''
         Add a finding unless one with the same code and subject already exists.
         Recommendation and limitations are attached from the central tables by code.
@@ -175,7 +184,7 @@ class FindingCollector:
             evidence (list[str]): Supporting observations.
             source (str): Where the evidence came from.
         '''
-        finding_id = f"{code}:{subject}"
+        finding_id: str = f"{code}:{subject}"
         if finding_id in self._items:
             return
         self._items[finding_id] = Finding(
@@ -200,10 +209,4 @@ class FindingCollector:
                                                 or subject in o.target or o.target in subject)]
             finding.evidence_refs = refs[:limit]
 
-    def sorted(self) -> list[Finding]:
-        '''
-        Return findings ordered by severity (most severe first), then category and id.
-        Returns:
-            list[Finding]: The collected findings.
-        '''
-        return sorted(self._items.values(), key=lambda f: (-f.severity.rank, f.category, f.id))
+    def sorted(self) -> list[Finding]: return sorted(self._items.values(), key=lambda f: (-f.severity.rank, f.category, f.id))

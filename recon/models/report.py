@@ -7,9 +7,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from recon.models.common import CollectionError, Confidence, ModuleResult, Severity  # noqa: F401
+from recon.models.common import CollectionError, Confidence, FindingState, ModuleResult, Severity  # noqa: F401
 from recon.models.assets import AssetData
 from recon.models.cookies import CookieData
 from recon.models.crawl import CrawlData
@@ -26,12 +26,20 @@ from recon.models.third_party import ThirdPartyData
 from recon.models.tls import TlsData
 from recon.models.whois import DomainRegistration
 
-SCHEMA_VERSION: str = "2.0"
+# 2.1 adds optional provenance/freshness fields to observations and a lifecycle `state` to findings; all
+# are additive with safe defaults, so reports written by 2.0 still load.
+SCHEMA_VERSION: str = "2.1"
 
 
 class Finding(BaseModel):
     '''
     An interpreted, evidence-backed observation.
+
+    ``state`` is the finding's lifecycle position (orthogonal to ``severity`` and ``confidence``). When a
+    producer does not set it, it is derived from ``confidence`` on construction: low confidence starts
+    SUSPECTED, otherwise CONFIRMED. CORROBORATED/RESOLVED/FALSE_POSITIVE are assigned only by the analysis
+    engine from cross-source correlation or history. Reports written before 2.1 have no ``state`` and get
+    the same derivation when loaded.
     '''
     id: str
     category: str
@@ -39,6 +47,7 @@ class Finding(BaseModel):
     description: str
     severity: Severity
     confidence: Confidence
+    state: FindingState | None = None    # derived from confidence when unset (see _derive_state)
     evidence: list[str] = Field(default_factory=list)
     source: str
     subject: str
@@ -46,6 +55,17 @@ class Finding(BaseModel):
     recommendation: str | None = None
     limitations: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)   # Observation ids supporting this finding
+
+    @model_validator(mode="after")
+    def _derive_state(self) -> Finding:
+        '''
+        Fill a missing lifecycle state from the finding's confidence, so every finding has one.
+        Returns:
+            Finding: This finding, with ``state`` set.
+        '''
+        if self.state is None:
+            self.state = FindingState.from_confidence(self.confidence)
+        return self
 
 
 class InfrastructureObservation(BaseModel):

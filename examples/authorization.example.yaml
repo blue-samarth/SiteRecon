@@ -31,10 +31,48 @@ checks_enabled: []
 
 # --- per-check configuration (only needed for the checks you enable) ---
 
-# supabase:
-#   host: yourref.supabase.co
-#   anon_key: "eyJ...public-anon-key..."   # public anon key ONLY (service_role is rejected)
-#   tables: [profiles, items]
+# backend_read_access: "can a public, client-side credential read data it shouldn't?"
+# One read-only probe per resource. Each backend has a `kind`; a private/server-side credential
+# (service_role, sb_secret_, a service-account JSON, a known secret pattern) is rejected before any
+# request. Add each backend's host to scope.hosts above, or the backend is skipped.
+#
+# backends:
+#   - kind: supabase
+#     host: yourref.supabase.co
+#     credential: "eyJ...public-anon-key..."   # public anon key ONLY (service_role is rejected)
+#     resources: [profiles, items]             # table names; one request per table, no pagination
+#
+#   - kind: firebase
+#     project_id: my-app-1234
+#     database: firestore                      # or realtime_db (scope host: my-app-1234.firebaseio.com)
+#     credential: null                         # Firestore REST often needs none to test the open case
+#     resources: [users, orders]               # collection names (firestore) or paths (realtime_db)
+#
+#   - kind: hasura
+#     host: my-app.hasura.app                  # POST /v1/graphql with x-hasura-role: anonymous
+#     role: anonymous
+#     resources: [users, orders]               # GraphQL type/table names
+#
+#   - kind: pocketbase
+#     base_url: "https://pb.example.com"
+#     resources: [posts, comments]             # collection names
+#
+#   - kind: rest_generic                       # most sites: their own API with a key shipped to the client
+#     base_url: "https://api.example.com"
+#     credential_header: "X-Api-Key"           # or credential_param: "apikey"
+#     credential: "pk_live_public..."
+#     resources:
+#       - path: "/v1/users?limit=1"
+#         success_if: {status: 200, body_contains: "email"}   # YOU define open vs denied here
+#         denied_if: {status: [401, 403]}
+#
+#   - kind: graphql_generic
+#     url: "https://api.example.com/graphql"
+#     credential_header: "Authorization"
+#     credential: "Bearer public-token"
+#     resources:
+#       - name: me
+#         query: "query { me { id } }"
 
 # function_urls:
 #   - url: "https://api.example.com/order"

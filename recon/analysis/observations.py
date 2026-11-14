@@ -1,14 +1,43 @@
-'''
-Builds normalized observations from module results. Observations are the stable unit used for
-finding evidence references and for comparing scans over time.
-'''
-
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 from typing import Any
 
-from recon.models import Confidence, ModuleResult, ModuleStatus, Observation
+from recon.models import CollectionMethod, Confidence, Freshness, ModuleResult, ModuleStatus, Observation
+
+
+def _parse_date(value: str | None) -> datetime | None:
+    '''
+    Parse a YYYY-MM-DD database-build date into a timezone-aware datetime, or None.
+    Parameters:
+        value (str | None): The date string.
+    Returns:
+        datetime | None: The parsed datetime (UTC), or None if absent/unparseable.
+    '''
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+_COLLECTION_METHOD: dict[str, CollectionMethod] = {
+    "dns": CollectionMethod.DNS_QUERY,
+    "dnssec": CollectionMethod.DNS_QUERY,
+    "network": CollectionMethod.NETWORK_LOOKUP,
+    "http": CollectionMethod.HTTP_REQUEST,
+    "tls": CollectionMethod.TLS_HANDSHAKE,
+    "whois": CollectionMethod.WHOIS_LOOKUP,
+    "resources": CollectionMethod.HTTP_REQUEST,
+    "crawler": CollectionMethod.HTTP_REQUEST,
+    "html": CollectionMethod.STATIC_ANALYSIS,
+    "javascript": CollectionMethod.STATIC_ANALYSIS,
+    "technology": CollectionMethod.DERIVED,
+    "cookies": CollectionMethod.HTTP_REQUEST,
+    "subdomains": CollectionMethod.CT_LOG,
+    "third_party": CollectionMethod.DERIVED,
+}
 
 
 class ObservationBuilder:
@@ -29,17 +58,7 @@ class ObservationBuilder:
         self._out: dict[str, Observation] = {}
 
     @staticmethod
-    def make_id(type_: str, target: str, key: str) -> str:
-        '''
-        Stable observation identifier.
-        Parameters:
-            type_ (str): Observation type.
-            target (str): Observed target.
-            key (str): Distinguishing key.
-        Returns:
-            str: 12-hex-character id.
-        '''
-        return hashlib.sha1(f"{type_}|{target}|{key}".encode()).hexdigest()[:12]
+    def make_id(type_: str, target: str, key: str) -> str: return hashlib.sha1(f"{type_}|{target}|{key}".encode()).hexdigest()[:12]
 
     def build(self) -> list[Observation]:
         '''
@@ -56,7 +75,9 @@ class ObservationBuilder:
         return sorted(self._out.values(), key=lambda o: (o.type, o.target, o.key))
 
     def _add(self, result: ModuleResult, type_: str, target: str, key: str, value: Any, source: str,
-             confidence: Confidence = Confidence.HIGH) -> None:
+             confidence: Confidence = Confidence.HIGH, *, collection_method: str | None = None,
+             external_provider: str | None = None, observed_at: datetime | None = None,
+             freshness: Freshness | None = None) -> None:
         '''
         Record one observation; the first one recorded for a (type, target, key) wins, so probes that end
         at the same URL (e.g. https:// and https://www. redirecting to one page) are not duplicated.
@@ -68,16 +89,21 @@ class ObservationBuilder:
             value (Any): JSON-serializable value.
             source (str): Evidence source description.
             confidence (Confidence): Confidence in the observation.
+            collection_method (str | None): Override the module's default collection method.
+            external_provider (str | None): Third-party/offline provider this fact came from, if any.
+            observed_at (datetime | None): When the fact was true at the source, if different from collection.
+            freshness (Freshness | None): Override the default freshness (FRESH for direct collection).
         '''
-        obs_id = self.make_id(type_, target, key)
-        if obs_id in self._out:
-            return
+        obs_id: str = self.make_id(type_, target, key)
+        if obs_id in self._out: return
+
         self._out[obs_id] = Observation(
             id=obs_id, module=result.module, target=target, type=type_, key=key,
-            value=value, source=source, timestamp=result.finished_at, confidence=confidence,
+            value=value, source=source,
+            collection_method=collection_method or _COLLECTION_METHOD.get(result.module, CollectionMethod.UNKNOWN),
+            timestamp=result.finished_at, observed_at=observed_at, confidence=confidence,
+            freshness=freshness or Freshness.FRESH, external_provider=external_provider,
             status=result.status.value)
-
-    # ------------------------------------------------------------------ per module
 
     def _dns(self, r: ModuleResult) -> None:
         '''
@@ -120,6 +146,14 @@ class ObservationBuilder:
             self._add(r, "network.ip", ip.ip, "allocation", {
                 "asn": ip.asn.asn if ip.asn else None, "asn_name": ip.asn.name if ip.asn else None,
                 "rdap_network": ip.rdap.name if ip.rdap else None, "ptr": sorted(ip.ptr)}, "ASN/RDAP/PTR")
+            geo = ip.geo
+            if geo is not None and (geo.country or geo.city):
+                observed = _parse_date(geo.database_date)
+                self._add(r, "network.geo", ip.ip, "location",
+                          {"country": geo.country_code or geo.country, "region": geo.region, "city": geo.city},
+                          f"offline geolocation database ({geo.source})", confidence=Confidence.MEDIUM,
+                          collection_method=CollectionMethod.LOCAL_DATABASE, external_provider=geo.source,
+                          observed_at=observed, freshness=Freshness.UNKNOWN)
 
     def _http(self, r: ModuleResult) -> None:
         '''
@@ -164,6 +198,30 @@ class ObservationBuilder:
         self._add(r, "registration", d.domain, "expires", d.expires.isoformat() if d.expires else None, d.source)
         self._add(r, "registration", d.domain, "status", sorted(d.status), d.source)
         self._add(r, "registration", d.domain, "nameservers", sorted(d.nameservers), d.source)
+
+    def _html(self, r: ModuleResult) -> None:
+        '''
+        Landing-page SEO metadata and social (Open Graph / Twitter) cards, so metadata changes are tracked
+        across scans and can back SEO/social findings as evidence. Only present values are recorded, so a
+        later scan that drops a tag shows up as a removed observation rather than a change to null.
+        Parameters:
+            r (ModuleResult): HTML module result.
+        '''
+        d = r.data
+        page = d.source_url
+        for key, value in (("title", d.title), ("description", d.meta_description), ("canonical", d.canonical),
+                           ("robots", d.robots), ("generator", d.generator), ("lang", d.lang)):
+            if value is not None:
+                self._add(r, "html.metadata", page, key, value, f"<head> metadata on {page}")
+        if d.open_graph:
+            self._add(r, "html.open_graph", page, "properties", dict(sorted(d.open_graph.items())),
+                      f"og:* meta on {page}")
+        if d.twitter:
+            self._add(r, "html.twitter", page, "card", dict(sorted(d.twitter.items())), f"twitter:* meta on {page}")
+        if d.verification_tokens:
+            # names only (e.g. google-site-verification); the token values are not recorded
+            self._add(r, "html.verification", page, "providers", sorted(d.verification_tokens),
+                      f"site-verification meta on {page}")
 
     def _resources(self, r: ModuleResult) -> None:
         '''
