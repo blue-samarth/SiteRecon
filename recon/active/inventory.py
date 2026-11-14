@@ -1,12 +1,3 @@
-'''
-Passive-to-active handoff inventory.
-
-When ``active`` runs the passive scan first, it writes the discovered sitemap URLs, crawled pages,
-bundle-referenced endpoints and hosts to ``inventory.json``. The active step reads that file back and
-uses it to cross-check the operator's authorized endpoints, so a path the scan never saw is visible.
-The file is the explicit handoff artifact, so ``--no-passive`` can reuse a prior inventory.
-'''
-
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -16,8 +7,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, ValidationError
 
-if TYPE_CHECKING:
-    from recon.models import ReconReport
+if TYPE_CHECKING: from recon.models import ReconReport
 
 
 class Inventory(BaseModel):
@@ -32,17 +22,8 @@ class Inventory(BaseModel):
     endpoints: list[str] = Field(default_factory=list)
     hosts: list[str] = Field(default_factory=list)
 
-    def url_keys(self) -> set[str]:
-        '''
-        Normalized 'host/path' keys for every known page, sitemap and endpoint URL.
-        '''
-        return {_key(u) for u in (*self.pages, *self.sitemap_urls, *self.endpoints)}
-
-    def known_hosts(self) -> set[str]:
-        '''
-        All discovered hostnames, lowercased.
-        '''
-        return {h.lower().rstrip(".") for h in self.hosts if h}
+    def url_keys(self) -> set[str]: return {_key(u) for u in (*self.pages, *self.sitemap_urls, *self.endpoints)}
+    def known_hosts(self) -> set[str]: return {h.lower().rstrip(".") for h in self.hosts if h}
 
     def summary(self) -> str:
         '''
@@ -52,17 +33,7 @@ class Inventory(BaseModel):
                 f"{len(self.endpoints)} endpoints, {len(self.hosts)} hosts")
 
 
-def _key(url: str) -> str:
-    '''
-    Normalize a URL to lowercase 'host/path' (query and fragment dropped, trailing slash trimmed).
-    Parameters:
-        url (str): URL.
-    Returns:
-        str: The host + path key.
-    '''
-    parts = urlsplit(url)
-    return f"{(parts.hostname or '').lower()}{parts.path.rstrip('/') or '/'}"
-
+def _key(url: str) -> str: parts = urlsplit(url); return f"{(parts.hostname or '').lower()}{parts.path.rstrip('/') or '/'}"
 
 def build_inventory(report: ReconReport) -> Inventory:
     '''

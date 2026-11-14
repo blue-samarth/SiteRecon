@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 from recon.models import AsnInfo, CollectionError, DnsQueryStatus, IpIntel, NetworkData, RdapNetwork
 from recon.modules.base import Collector
-from recon.utils import DnsClient, SafeHttpClient, Scope, is_public_ip
+from recon.utils import DnsClient, GeoLocator, SafeHttpClient, Scope, is_public_ip
 
 IpAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -29,17 +29,21 @@ class NetworkCollector(Collector[NetworkData]):
         "rdap.lacnic.net", "rdap.afrinic.net",
     ])
 
-    def __init__(self, ips: list[str], dns_client: DnsClient, rdap_client: SafeHttpClient) -> None:
+    def __init__(self, ips: list[str], dns_client: DnsClient, rdap_client: SafeHttpClient,
+                 geo_locator: GeoLocator | None = None) -> None:
         '''
         Create the collector.
         Parameters:
             ips (list[str]): Resolved addresses (duplicates are ignored).
             dns_client (DnsClient): DNS client used for lookups.
             rdap_client (SafeHttpClient): HTTP client scoped to RDAP servers.
+            geo_locator (GeoLocator | None): Optional offline geolocation database for city-level estimates;
+                None (the default) leaves ``geo`` unset and the hosting estimate falls back to ASN/RDAP country.
         '''
         self.ips = list(dict.fromkeys(ips))
         self.dns_client = dns_client
         self.rdap_client = rdap_client
+        self.geo_locator = geo_locator
 
     async def collect(self) -> tuple[NetworkData, list[CollectionError]]:
         '''
@@ -72,6 +76,9 @@ class NetworkCollector(Collector[NetworkData]):
 
         if not intel.is_public:
             return intel, errors  # registry data is meaningless for private/reserved space
+
+        if self.geo_locator is not None:
+            intel.geo = self.geo_locator.lookup(ip)   # local DB lookup, no network I/O; None if not found
 
         intel.asn = await self._lookup_asn(addr, errors)
 

@@ -139,10 +139,10 @@ async def test_empty_registry_run_produces_valid_empty_report():
 
 
 async def test_orchestrator_skips_unready_and_unknown_checks():
-    a = auth(checks_enabled=["supabase_rls", "bogus_check", "tls_protocol_enum"])
+    a = auth(checks_enabled=["backend_read_access", "bogus_check", "tls_protocol_enum"])
     report = await ActiveOrchestrator(a, now=NOW).run()
     by = {c.check_id: c for c in report.checks}
-    assert by["supabase_rls"].status is ModuleStatus.SKIPPED and "supabase" in by["supabase_rls"].skipped_reason
+    assert by["backend_read_access"].status is ModuleStatus.SKIPPED and "backends" in by["backend_read_access"].skipped_reason
     assert by["bogus_check"].status is ModuleStatus.SKIPPED and "unknown" in by["bogus_check"].skipped_reason
     assert by["tls_protocol_enum"].status is ModuleStatus.SKIPPED   # no tls_authorized host
     assert report.requests_made == 0
@@ -162,9 +162,9 @@ async def test_orchestrator_isolates_check_exceptions(monkeypatch):
 
 
 async def test_orchestrator_plan_is_pure():
-    a = auth(checks_enabled=["supabase_rls", "tls_protocol_enum"])
+    a = auth(checks_enabled=["backend_read_access", "tls_protocol_enum"])
     plan = dict(ActiveOrchestrator(a, now=NOW).plan())
-    assert plan["supabase_rls"] is not None and plan["tls_protocol_enum"] is not None   # both would skip
+    assert plan["backend_read_access"] is not None and plan["tls_protocol_enum"] is not None   # both would skip
 
 
 async def test_run_through_a_registered_check_end_to_end():

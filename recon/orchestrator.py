@@ -20,7 +20,7 @@ from typing import Any, ClassVar, TypeVar
 from urllib.parse import urlsplit
 
 from recon import TOOL_NAME, __version__
-from recon.analysis import AnalysisEngine, ObservationBuilder, ScanComparator
+from recon.analysis import SIGNATURES_VERSION, AnalysisEngine, ObservationBuilder, ScanComparator
 from recon.config import ALL_MODULES, Config
 from recon.models import (
     AnalysisResult,
@@ -52,7 +52,7 @@ from recon.modules import (
     WhoisCollector,
 )
 from recon.storage import ScanStore
-from recon.utils import DnsClient, SafeHttpClient, Scope, get_logger
+from recon.utils import DnsClient, GeoLocator, SafeHttpClient, Scope, get_logger
 
 T = TypeVar("T")
 
@@ -113,6 +113,8 @@ class ScanOrchestrator:
         )
         public_only = {**self._client_kwargs, "allow_private_networks": False}
         self.dns_client = dns_client or DnsClient(config.timeout, config.retries, config.concurrency)
+        # Optional offline geolocation DB for city-level hosting estimates; None if not configured/available.
+        self.geo_locator = GeoLocator.open(config.geoip_db)
         self.dnssec_client = dnssec_client
         self.target_client = target_client or SafeHttpClient(self.scope, **self._client_kwargs)
         self.rdap_client = rdap_client or SafeHttpClient(
@@ -200,7 +202,8 @@ class ScanOrchestrator:
 
             (network_result, http_result, tls_result, whois_result, subdomains_result,
              dnssec_result) = await asyncio.gather(
-                self._maybe("network", lambda: NetworkCollector(ips, self.dns_client, self.rdap_client),
+                self._maybe("network", lambda: NetworkCollector(ips, self.dns_client, self.rdap_client,
+                                                                self.geo_locator),
                             None if ips else "no A/AAAA addresses resolved"),
                 self._maybe("http", lambda: HttpCollector(host, self.target_client)),
                 self._maybe("tls", lambda: TlsCollector(host, timeout=cfg.timeout, retries=cfg.retries,
@@ -232,7 +235,7 @@ class ScanOrchestrator:
             assets_result = await self._maybe("javascript", lambda: AssetCollector(
                 host, asset_client, map_client, html=html_result.data, crawl=crawler_result.data,
                 allowed_hosts=cfg.asset_hosts, max_assets=cfg.max_assets,
-                max_total_bytes=cfg.max_assets_total_bytes),
+                max_total_bytes=cfg.max_assets_total_bytes, retain_client_keys=cfg.retain_client_keys),
                 None if (html_result.data or crawler_result.data) else "requires HTML or crawl results")
 
         crawl = crawler_result.data
@@ -260,14 +263,17 @@ class ScanOrchestrator:
         )
         report.observations = ObservationBuilder(host, report.module_results()).build()
         report.analysis = AnalysisEngine(utcnow()).analyze(
-            dns=dns_result.data, network=network_result.data, http=http, tls=tls_result.data,
+            dns=dns_result.data, network=network_result.data, http=http, tls=tls_result.data, host=host,
             whois=whois_result.data, html=html_result.data, subdomains=subdomains_result.data,
             dnssec=dnssec_result.data, resources=resources_result.data, crawl=crawl,
-            cookies=cookies_result.data, assets=assets, observations=report.observations,
+            cookies=cookies_result.data, assets=assets, third_party=third_party_result.data,
+            observations=report.observations,
         )
         report.errors = [e for m in report.module_results().values() for e in m.errors]
         report.finished_at = utcnow()
         report.duration_ms = round((perf_counter() - t0) * 1000, 2)
+        if self.geo_locator is not None:
+            self.geo_locator.close()
         return report
 
     def origin(self, host: str, http: HttpData | None) -> str:
@@ -299,7 +305,9 @@ class ScanOrchestrator:
                 "crawl_depth": c.crawl_depth, "max_pages": c.max_pages, "crawl_delay": c.crawl_delay,
                 "respect_robots": c.respect_robots, "concurrency": c.concurrency, "max_assets": c.max_assets,
                 "asset_hosts": list(c.asset_hosts),
-                "format": c.output_format.value, "allow_private_networks": c.allow_private_networks}
+                "format": c.output_format.value, "allow_private_networks": c.allow_private_networks,
+                "signatures_version": SIGNATURES_VERSION,
+                "geoip_db": str(c.geoip_db) if c.geoip_db else None}
 
     @classmethod
     async def run_collector(cls, collector: Collector[T]) -> ModuleResult[T]:

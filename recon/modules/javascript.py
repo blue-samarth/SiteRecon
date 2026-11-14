@@ -265,31 +265,34 @@ class ClientConfigExtractor:
     _SUPABASE_URL: ClassVar[re.Pattern[str]] = re.compile(r"https://([a-z0-9]{20})\.supabase\.co", re.I)
 
     @classmethod
-    def extract(cls, text: str, source_asset: str) -> list[ClientConfig]:
+    def extract(cls, text: str, source_asset: str, retain: bool = False) -> list[ClientConfig]:
         '''
         Find Firebase and Supabase client configs.
         Parameters:
             text (str): Bundle text.
             source_asset (str): Asset URL (for attribution).
+            retain (bool): Keep public key values unredacted (default redacts). These keys are public by
+                design; retention is used only for authorized automated backend testing (--bypass-sec).
         Returns:
             list[ClientConfig]: Detected public config blocks.
         '''
         configs: list[ClientConfig] = []
-        fb = cls._firebase(text, source_asset)
+        fb = cls._firebase(text, source_asset, retain)
         if fb:
             configs.append(fb)
-        sb = cls._supabase(text, source_asset)
+        sb = cls._supabase(text, source_asset, retain)
         if sb:
             configs.append(sb)
         return configs
 
     @classmethod
-    def _firebase(cls, text: str, source_asset: str) -> ClientConfig | None:
+    def _firebase(cls, text: str, source_asset: str, retain: bool = False) -> ClientConfig | None:
         '''
-        Extract a Firebase config object (projectId shown; apiKey/appId redacted).
+        Extract a Firebase config object (projectId shown; apiKey/appId redacted unless retained).
         Parameters:
             text (str): Bundle text.
             source_asset (str): Asset URL.
+            retain (bool): Keep public key values unredacted.
         Returns:
             ClientConfig | None: The config, or None if not present.
         '''
@@ -297,19 +300,20 @@ class ClientConfigExtractor:
         for key in cls._FIREBASE_KEYS:
             m = re.search(rf"""['"]?{key}['"]?\s*:\s*['"]([^'"]{{1,256}})['"]""", text)
             if m:
-                fields.append(cls._field(key, m.group(1)))
+                fields.append(cls._field(key, m.group(1), retain))
         has_project = any(f.key == "projectId" for f in fields)
         if len(fields) >= 3 and has_project:
             return ClientConfig(provider="Firebase", kind="firebase", source_asset=source_asset, fields=fields)
         return None
 
     @classmethod
-    def _supabase(cls, text: str, source_asset: str) -> ClientConfig | None:
+    def _supabase(cls, text: str, source_asset: str, retain: bool = False) -> ClientConfig | None:
         '''
-        Extract a Supabase project URL (the public anon key, if adjacent, is redacted).
+        Extract a Supabase project URL (the public anon key, if adjacent, is redacted unless retained).
         Parameters:
             text (str): Bundle text.
             source_asset (str): Asset URL.
+            retain (bool): Keep the public anon key unredacted.
         Returns:
             ClientConfig | None: The config, or None if not present.
         '''
@@ -320,20 +324,22 @@ class ClientConfigExtractor:
                   ClientConfigValue(key="url", value=f"https://{m.group(1)}.supabase.co", sensitive=False)]
         anon = re.search(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", text)
         if anon:
-            fields.append(ClientConfigValue(key="anonKey", value=redact_secret(anon.group(0)), sensitive=True))
+            value = anon.group(0) if retain else redact_secret(anon.group(0))
+            fields.append(ClientConfigValue(key="anonKey", value=value, sensitive=not retain))
         return ClientConfig(provider="Supabase", kind="supabase", source_asset=source_asset, fields=fields)
 
     @classmethod
-    def _field(cls, key: str, value: str) -> ClientConfigValue:
+    def _field(cls, key: str, value: str, retain: bool = False) -> ClientConfigValue:
         '''
-        Build a config field, redacting key/token-like fields.
+        Build a config field, redacting key/token-like fields unless retention is requested.
         Parameters:
             key (str): Field name.
             value (str): Field value.
+            retain (bool): Keep public key values unredacted.
         Returns:
             ClientConfigValue: Field with the value shown or redacted.
         '''
-        if key.lower() in cls._SECRET_FIELDS:
+        if key.lower() in cls._SECRET_FIELDS and not retain:
             return ClientConfigValue(key=key, value=redact_secret(value), sensitive=True)
         return ClientConfigValue(key=key, value=value[:256], sensitive=False)
 
@@ -601,6 +607,7 @@ class AssetCollector(Collector[AssetData]):
         max_assets: int = 30,
         max_total_bytes: int = 20 * 1024 * 1024,
         concurrency: int = 4,
+        retain_client_keys: bool = False,
     ) -> None:
         '''
         Create the collector.
@@ -624,6 +631,7 @@ class AssetCollector(Collector[AssetData]):
         self.allowed_hosts = allowed_hosts
         self.max_assets = max_assets
         self.max_total_bytes = max_total_bytes
+        self.retain_client_keys = retain_client_keys
         self._sem = asyncio.Semaphore(max(1, concurrency))
         self._bytes = 0
 
@@ -720,7 +728,7 @@ class AssetCollector(Collector[AssetData]):
         rec.libraries = BundleAnalyzer.libraries(text)
         rec.service_hosts = [h for h in BundleAnalyzer.hosts(text) if h != own_host]
         rec.endpoints = EndpointExtractor.extract(text, own_host, self.scope)
-        rec.client_configs = ClientConfigExtractor.extract(text, rec.url)
+        rec.client_configs = ClientConfigExtractor.extract(text, rec.url, retain=self.retain_client_keys)
         rec.secrets = SecretScanner.scan(text, rec.url)
         map_ref = BundleAnalyzer.source_map(text, resp.header("sourcemap") or resp.header("x-sourcemap"))
         if map_ref:

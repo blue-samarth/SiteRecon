@@ -27,6 +27,7 @@ from recon.utils.redact import REDACTED, redact_secret, redact_url
 from recon.utils.resolver import DnsClient, format_rdata, system_resolve
 from recon.utils.scope import Scope, is_public_ip
 from recon.utils.validators import InvalidTargetError, normalize_target, validate_hostname
+from recon.utils.geoip import GeoLocator
 
 __all__ = [
     "host_of", "matches_suffix", "normalize_discovered", "registrable_domain", "public_suffix",
@@ -38,4 +39,5 @@ __all__ = [
     "DnsClient", "format_rdata", "system_resolve",
     "Scope", "is_public_ip",
     "InvalidTargetError", "normalize_target", "validate_hostname",
+    "GeoLocator",
 ]

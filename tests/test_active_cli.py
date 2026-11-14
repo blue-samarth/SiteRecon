@@ -49,7 +49,8 @@ def test_dry_run_prints_plan_and_makes_no_requests(tmp_path, monkeypatch):
     res = invoke(["active", "jobbie.io", "-A", str(write_auth(tmp_path)), "--dry-run"])
     assert res.exit_code == 0, res.output
     assert "dry run" in res.output and "within window" in res.output
-    assert "supabase_rls" in res.output and "tls_protocol_enum" in res.output
+    # the legacy `supabase_rls` id in the file is migrated to `backend_read_access` on load
+    assert "backend_read_access" in res.output and "tls_protocol_enum" in res.output
     assert "function_url_reachability" in res.output and "skip" in res.output   # no function_urls listed
     assert "No requests were made" in res.output
 

@@ -18,7 +18,10 @@ from recon.models.assets import (
 )
 from recon.models.common import (
     CollectionError,
+    CollectionMethod,
     Confidence,
+    FindingState,
+    Freshness,
     ModuleResult,
     ModuleStatus,
     Severity,
@@ -41,7 +44,7 @@ from recon.models.dns import (
 from recon.models.dnssec import DnssecData, DnssecStatus
 from recon.models.html import HtmlData, ResourceRef
 from recon.models.http import HttpData, HttpHop, HttpProbe, SecurityHeader
-from recon.models.network import AsnInfo, IpIntel, NetworkData, RdapNetwork
+from recon.models.network import AsnInfo, GeoLocation, IpIntel, NetworkData, RdapNetwork
 from recon.models.observations import ChangeKind, Change, ComparisonResult, Observation, ScanRef
 from recon.models.resources import (
     FetchedResource,
@@ -69,14 +72,15 @@ from recon.models.whois import DomainRegistration
 
 __all__ = [
     # common
-    "CollectionError", "Confidence", "ModuleResult", "ModuleStatus", "Severity", "utcnow",
+    "CollectionError", "CollectionMethod", "Confidence", "FindingState", "Freshness",
+    "ModuleResult", "ModuleStatus", "Severity", "utcnow",
     # dns
     "DkimSelectorResult", "DmarcAnalysis", "DnsData", "DnsQueryResult", "DnsQueryStatus",
     "DnsRecord", "EmailSecurity", "SpfAnalysis", "SpfRecord",
     # html / http
     "HtmlData", "ResourceRef", "HttpData", "HttpHop", "HttpProbe", "SecurityHeader",
     # network
-    "AsnInfo", "IpIntel", "NetworkData", "RdapNetwork",
+    "AsnInfo", "GeoLocation", "IpIntel", "NetworkData", "RdapNetwork",
     # report / analysis output
     "SCHEMA_VERSION", "AnalysisResult", "Finding", "InfrastructureObservation", "ReconReport",
     "TargetInfo", "ToolInfo",

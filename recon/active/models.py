@@ -1,18 +1,9 @@
-'''
-Active-testing report models.
-
-Kept separate from the passive ``ReconReport`` so a passive report is never silently extended with
-active fields, but reusing ``Finding``, ``ModuleStatus`` and ``CollectionError`` so the existing
-report writers extend naturally.
-'''
-
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
-
 from recon.models import CollectionError, Finding, ModuleStatus, TargetInfo
 
 SCHEMA_VERSION: str = "0.1"
@@ -24,7 +15,7 @@ class RequestLogEntry(BaseModel):
     '''
     check_id: str
     method: str
-    url: str                 # query values redacted
+    url: str
     status: int | None = None
     note: str | None = None
 
@@ -53,7 +44,7 @@ class ActiveReport(BaseModel):
     schema_version: str = SCHEMA_VERSION
     scan_id: str
     tool: dict[str, str]
-    authorization: dict[str, Any]     # redacted summary, never the raw file (see redact_authorization)
+    authorization: dict[str, Any]
     target: TargetInfo
     window_ok: bool
     checks: list[ActiveCheckResult] = Field(default_factory=list)

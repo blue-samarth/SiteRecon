@@ -1,7 +1,7 @@
 # Active testing (`siterecon active`)
 
 The `scan` command is strictly passive: GET/HEAD, DNS, and TLS handshakes only. The `active`
-command is separate and sends more than that — row-level-security probes, reachability requests,
+command is separate and sends more than that — backend read-access probes, reachability requests,
 a small rate-limit burst, per-version TLS handshakes — so it is gated behind an operator-authored
 **authorization file**. There is no flag or environment variable that bypasses it, and `active`
 never runs as part of `scan`.
@@ -38,14 +38,85 @@ The command refuses to run (exit code 2) if:
 - the authorization file is missing, malformed, or missing a required field;
 - the command's target does not match the file's `target`;
 - the current time is outside the file's `window` (a real run; `--dry-run` only warns);
-- the Supabase key provided is private — a `service_role` JWT or a new-format secret key (`sb_secret_…`) —
-  rather than the public anon/publishable key. The JWT signature is not verified (that needs the project
-  secret); this is a structural guard, so a key that is neither form is accepted as the expected anon key.
+- any backend credential provided is private rather than a public/client-side key — a Supabase
+  `service_role` JWT or new-format secret key (`sb_secret_…`), a Firebase/Google service-account JSON or
+  private key block, or any value matching a known private-credential pattern (the same `SecretScanner`
+  used by the passive scan). JWT signatures are not verified (that needs the project secret); this is a
+  structural guard, so a value that matches no private shape is accepted as the expected public credential.
 
 ## Authorization file
 
 YAML or JSON. The scope is authored by hand and is **never** inferred from a passive scan — table
 names, function URLs and email endpoints are all copied in explicitly by the operator.
+
+### Automated discover-and-test (CI)
+
+For a pipeline you want the whole discover→test loop automated with **no per-run human step**. Commit an
+authorization with an `auto_discover` block — a *standing* assertion that you own certain registrable
+domains — reviewed once in a PR (that is the one-time human gate), then run it on every pipeline execution:
+
+```yaml
+target: clusterheart.com
+authorized_by: "CI"
+authorized_on: "2026-11-11"
+window: { start: "2026-11-01T00:00:00Z", end: "2027-11-01T00:00:00Z" }   # standing window
+auto_discover:
+  authorized_domains: [clusterheart.com]     # the ownership boundary
+```
+
+```bash
+siterecon active clusterheart.com --authorization auth.ci.yaml --format json --fail-on high
+```
+
+Each run passively discovers first-party assets under the authorized domains, synthesizes the targets, and
+runs the **safe** checks (`tls_protocol_enum`, `function_url_reachability`, `external_intelligence`)
+automatically — picking up new in-scope endpoints as they appear. `--fail-on <severity>` exits **code 3**
+when any finding is at least that severe, so the build fails on regressions.
+
+Two lines are deliberate and load-bearing:
+
+- **Only first-party hosts are tested.** A discovered host is probed only if its registrable domain is in
+  `authorized_domains`; third-party hosts found in your site (analytics, CDNs, someone else's API or
+  Supabase project) are **reported but never tested**. This is the boundary that makes automation safe to
+  ship — you test your assets, not whatever you happen to find.
+- **Email bursting is never auto-enabled** (it can reach a real recipient), and backend reads are not yet
+  auto-run (they need a credential). Those stay explicit, per-endpoint opt-ins.
+
+The scaffold below (`scaffold-auth`) is the interactive cousin: it writes a draft for a human to edit,
+whereas `auto_discover` runs the same discovery non-interactively within a committed boundary.
+
+#### A complete local run (`--bypass-sec`)
+
+The CI default is the safe set (no credentials needed). For a **local** complete run of your own system,
+add `--bypass-sec` to an `auto_discover` run:
+
+```bash
+siterecon active clusterheart.com --authorization auth.ci.yaml --bypass-sec --format all
+```
+
+It runs the **complete** check set except email — `tls_protocol_enum`, `function_url_reachability`,
+`client_ip_header_trust`, `external_intelligence`, **and `backend_read_access`** — against your first-party
+hosts **and the backends your own site embeds**. To test the backend it keeps the public Supabase/Firebase
+key the passive scan found (normally redacted) and uses the table names it saw in `/rest/v1/<table>`
+references. Two things it still will not do: actively probe **unrelated** third-party hosts (Stripe,
+analytics, someone else's API — reported, never tested), or **burst email** endpoints. It requires an
+`auto_discover` block (for the ownership boundary) and is meant for local testing, not CI.
+
+### Scaffolding a draft (optional)
+
+Typing candidates in by hand is tedious, so SiteRecon can pre-fill a **draft** from a passive scan:
+
+```bash
+siterecon scaffold-auth jobbie.io          # writes reports/jobbie.io/active/authorization.draft.yaml
+```
+
+The draft lists the backends and endpoints the passive scan discovered, but **enables nothing**
+(`checks_enabled` is empty) and leaves the judgements the tool cannot make — whether you own a host,
+whether an endpoint is `state_changing`, whether an email endpoint is safe to burst
+(`confirmed_no_real_delivery`), and the public credential value — **blank on purpose**. It is inert until
+you review it, confirm you are authorized for every host (discovery is not ownership), fill the blanks and
+add the checks you want to `checks_enabled`. In other words: the tool proposes, the human approves. This is
+why the authorization is required and never auto-populated-and-run.
 
 ```yaml
 target: jobbie.io
@@ -65,12 +136,21 @@ scope:
   tls_authorized_hosts:                 # extra per-host opt-in required for tls_protocol_enum
     - muvsftgwvzuttktqtkmc.supabase.co
 checks_enabled:                         # a check runs only if it is named here AND its config is present
-  - supabase_rls
+  - backend_read_access
   - tls_protocol_enum
-supabase:
-  host: muvsftgwvzuttktqtkmc.supabase.co
-  anon_key: "eyJ...anon..."             # PUBLIC anon key only; a service_role key is rejected
-  tables: [profiles, items]             # one request per table, no pagination
+backends:                               # "can a public, client-side credential read data it shouldn't?"
+  - kind: supabase                      # each backend has its own `kind` and resource shape
+    host: muvsftgwvzuttktqtkmc.supabase.co
+    credential: "eyJ...anon..."         # PUBLIC anon key only; a service_role/secret key is rejected
+    resources: [profiles, items]        # table names; one request per resource, no pagination
+  - kind: rest_generic                  # your own API with a key shipped to the client (the common case)
+    base_url: "https://muvsftgwvzuttktqtkmc.supabase.co"
+    credential_header: "X-Api-Key"
+    credential: "pk_live_public..."
+    resources:
+      - path: "/v1/users?limit=1"
+        success_if: {status: 200, body_contains: "email"}   # you define open vs denied (no universal rule)
+        denied_if: {status: [401, 403]}
 function_urls:
   - url: "https://abc.lambda-url.ap-south-1.on.aws/order"
     method: OPTIONS                     # default; a single, side-effect-free request
@@ -85,7 +165,13 @@ ip_trust_endpoints:
   - url: "https://jobbie.io/admin"
     method: GET
     access_control: true                # label: gates access/rate on client IP (raises severity)
+external_intelligence:                  # only needed to restrict providers; the checks_enabled entry is enough
+  providers: [wayback, shodan_internetdb]
 ```
+
+Add `external_intelligence` to `checks_enabled` to run the third-party intelligence phase (see
+[intelligence.md](intelligence.md)); the `external_intelligence:` section is optional and only narrows
+which providers run.
 
 > **Note on "IP spoofing".** `client_ip_header_trust` does not forge source IP addresses at the packet
 > level. Packet-level source-IP spoofing cannot complete a TCP/TLS/HTTP exchange (the response never
@@ -101,11 +187,40 @@ omitted.
 
 | Check | What it sends | Request budget | Finding(s) |
 |---|---|---|---|
-| `supabase_rls` | One read-only `GET /rest/v1/<table>?select=*&limit=1` per listed table, using **only** the public anon key. No writes, no pagination. | 1 per table | `active.supabase_rls_open` (high) when a table returns rows with the anon key — RLS is not restricting anonymous reads. A permission error produces **no** finding (RLS is working). |
+| `backend_read_access` | One read-only probe per operator-listed backend **resource**, using **only** a public/client-side credential. No writes, no pagination. Each backend `kind` has its own probe and its own "open"/"denied" rule (see below). | 1 per resource | `active.backend_read_access_open` (high) when a resource returns data to the public credential — backend authorization (RLS / rules / role permissions) is not restricting anonymous reads. A denial produces **no** finding. |
 | `function_url_reachability` | One request per listed function URL with the configured method. GET/OPTIONS send no body; POST/PUT/PATCH send only an empty `{}` — never a payload that could create state. | 1 per URL | `active.endpoint_open` (high) when a URL you labeled `state_changing` answers an unauthenticated request; `active.endpoint_reachable` (info) otherwise. 401/403 → no finding. |
 | `email_endpoint_rate_limit` | A small, test-marked burst (`burst`, ≤10) paced at the engagement rate, **only** to endpoints with `confirmed_no_real_delivery: true`. Sends an `X-SiteRecon-Test` header and a test payload; skips any endpoint not confirmed safe. | ≤`burst` per endpoint | `active.no_rate_limit` (medium) when the whole burst is accepted with no 429/503. |
 | `tls_protocol_enum` | A handshake at each of TLS 1.0/1.1/1.2/1.3 against hosts carrying the per-host `tls_authorized` opt-in. No application data is sent. The evidence lists **every version offered and its outcome** (accepted / offered-rejected / not-attempted), and each handshake appears in the audit log. | 1 per version per host | `active.legacy_tls_accepted` (medium) when TLS 1.0/1.1 is negotiable; `active.tls_versions` (info) otherwise. |
+| `external_intelligence` | Queries keyless third-party providers (Wayback Machine, Shodan InternetDB) **about** the target — its domain and resolved IPs — never the target itself. Discloses the target to those providers. See [intelligence.md](intelligence.md). | ≤1 per Wayback domain + 1 per IP (Shodan) | `intel.archived_history`/`intel.archived_sensitive_path` (info/low) from the web archive; `intel.exposed_ports` (info) and `intel.indexed_vulnerability` (low, candidates) from Shodan's index. |
 | `client_ip_header_trust` | A baseline request plus two copies with client-IP headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`, `Forwarded`, …) set to test values (`127.0.0.1`, `10.0.0.1`). **No packets are forged** — these are ordinary request headers. Endpoints are operator-listed in `ip_trust_endpoints` (never guessed). | 3 per endpoint | `active.access_control_open` (high) when an endpoint labeled `access_control` already answers the plain baseline without auth; `active.client_ip_header_bypass` (high) when the status flips a decision with the headers (e.g. 403→200, 429→200); `active.client_ip_header_trusted` (low) when it merely varies. |
+
+### Backend adapters (`backend_read_access`)
+
+The underlying question — *does a public, client-side credential let you read data it shouldn't* — is not
+Supabase-specific. Supabase row-level security is one instance; the same shape covers Firebase rules, a
+Hasura anonymous-role query, a PocketBase collection, a bare REST API with a client-shipped key, or an
+open GraphQL endpoint. Each operator-listed backend names a `kind`, and each `kind` owns its request shape
+and its own definition of "open" vs "denied":
+
+| `kind` | Probe | "Open" signal | "Denied" signal |
+|---|---|---|---|
+| `supabase` | `GET /rest/v1/<table>?select=*&limit=1`, `apikey` header | 200 + JSON array (**even empty** — an empty array means the anon select was authorized, not denied) | 401/403 |
+| `firebase` | Firestore REST `…/documents/<collection>`, or Realtime DB `/<path>.json`, no auth (or public API key) | 200 + data (`null` for an empty-but-readable RTDB path still counts) | `PERMISSION_DENIED`, or 401/403 |
+| `hasura` | `POST /v1/graphql`, `x-hasura-role: anonymous`, minimal `{ <type>(limit: 1) { __typename } }` | 200 + `data.<type>` present, no `errors` | `errors` array (permission / field-not-found) |
+| `pocketbase` | `GET /api/collections/<name>/records?perPage=1` | 200 + `items` array | 400/401/403 |
+| `rest_generic` | operator's `path` + the public key `credential_header`/`credential_param` | operator's `success_if` (`status` / `body_contains`) | operator's `denied_if` |
+| `graphql_generic` | `POST <url>` with the operator's minimal query | 200 + `data` non-null, no `errors` | `errors`, or 401/403 |
+
+The `rest_generic` and `graphql_generic` adapters are what make this backend-agnostic: most sites are not
+on a named BaaS — they call their own API with a key that shipped to the client. There is no universal
+convention for those, so the operator states, per resource, what open and denied look like (`denied_if` is
+checked first, so an ambiguous response is never a false "open"). A credential that looks server-side — a
+Supabase `service_role`/`sb_secret_`, a service-account JSON, or any `SecretScanner` private pattern — is
+refused per backend before any request is sent.
+
+> **Backward compatibility.** The old top-level `supabase:` block and the `supabase_rls` check id still
+> work: on load, `supabase:` is folded into a `backends:` entry of `kind: supabase` and `supabase_rls` is
+> migrated to `backend_read_access`. New authorization files should use `backends:` directly.
 
 ### Safety rails
 
@@ -115,8 +230,10 @@ omitted.
 - **Scope is exact.** The active HTTP client is bound to the authorization's `scope.hosts` as exact
   hostnames, reusing the same SSRF guards as passive scanning (no private/loopback/metadata
   addresses). Out-of-scope requests are blocked and logged.
-- **No secrets stored or used.** The anon key is redacted (type + fingerprint) wherever it appears.
-  A `service_role` key is rejected outright. No discovered credential is ever used against a service.
+- **No secrets stored or used.** Every backend credential is redacted (type + fingerprint) wherever it
+  appears. A private/server-side credential (Supabase `service_role`/`sb_secret_`, a service-account JSON,
+  any known secret pattern) is rejected outright. No discovered credential is ever used against a service;
+  only the public, client-side credential the operator supplies by hand is sent.
 - **No side-effect payloads.** Reachability probes send empty bodies; the rate-limit check refuses
   any endpoint the operator has not confirmed cannot deliver to a real recipient.
 - **Full audit log.** Every request **and every TLS handshake** is recorded (method, query-redacted

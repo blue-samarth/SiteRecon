@@ -177,7 +177,40 @@ def test_secret_format_key_is_rejected():
 def test_redaction_hides_anon_key(tmp_path):
     auth = load_authorization(write(tmp_path, VALID))
     summary = redact_authorization(auth)
-    assert summary["supabase"]["host"] == "muvsftgwvzuttktqtkmc.supabase.co"
-    assert "sha256:" in summary["supabase"]["anon_key"]
+    backend = summary["backends"][0]                          # legacy supabase block folded into backends
+    assert backend["kind"] == "supabase" and backend["host"] == "muvsftgwvzuttktqtkmc.supabase.co"
+    assert "sha256:" in backend["credential"] and backend["resources"] == ["profiles", "items"]
     assert "eyJyb2xlIjoiYW5vbiJ9" not in json.dumps(summary)   # key material not present
     assert summary["scope_hosts"] and summary["checks_enabled"] == ["tls_protocol_enum"]
+
+
+def test_legacy_supabase_block_folds_into_backends(tmp_path):
+    auth = load_authorization(write(tmp_path, VALID))
+    assert [b.kind for b in auth.backends] == ["supabase"]
+    assert auth.backends[0].host == "muvsftgwvzuttktqtkmc.supabase.co"
+    assert auth.backends[0].resources == ["profiles", "items"]
+
+
+def test_supabase_rls_check_id_is_migrated(tmp_path):
+    text = VALID.replace("checks_enabled: [tls_protocol_enum]", "checks_enabled: [supabase_rls, tls_protocol_enum]")
+    auth = load_authorization(write(tmp_path, text))
+    assert auth.checks_enabled == ["backend_read_access", "tls_protocol_enum"]
+
+
+def test_new_backends_reject_privileged_credentials():
+    rest = {"kind": "rest_generic", "base_url": "https://a.io", "credential_header": "X-Api-Key",
+            "credential": "sk_live_" + "a" * 24, "resources": [{"path": "/x", "success_if": {"status": 200}}]}
+    with pytest.raises(ValidationError, match="private-credential pattern"):
+        AuthorizationFile.model_validate(_base(backends=[rest]))
+
+
+def test_rest_resource_requires_a_match_condition():
+    rest = {"kind": "rest_generic", "base_url": "https://a.io",
+            "resources": [{"path": "/x", "success_if": {}}]}
+    with pytest.raises(ValidationError, match="status.*body_contains|match spec"):
+        AuthorizationFile.model_validate(_base(backends=[rest]))
+
+
+def test_unknown_backend_kind_is_rejected():
+    with pytest.raises(ValidationError):
+        AuthorizationFile.model_validate(_base(backends=[{"kind": "mongo", "host": "a.io"}]))

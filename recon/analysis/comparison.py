@@ -1,10 +1,3 @@
-'''
-Compares two scans of the same target using their normalized observations.
-
-A key present in only one scan counts as added/removed only when the module that would have
-produced it completed successfully in the other scan; otherwise the change is 'unknown'.
-'''
-
 from __future__ import annotations
 
 from collections import Counter
@@ -80,12 +73,4 @@ class ScanComparator:
         )
 
     @staticmethod
-    def _index(observations: list[Observation]) -> dict[tuple[str, str, str], Observation]:
-        '''
-        Index observations by (type, target, key).
-        Parameters:
-            observations (list[Observation]): Observations of one scan.
-        Returns:
-            dict[tuple[str, str, str], Observation]: Lookup table.
-        '''
-        return {(o.type, o.target, o.key): o for o in observations}
+    def _index(observations: list[Observation]) -> dict[tuple[str, str, str], Observation]: return {(o.type, o.target, o.key): o for o in observations}

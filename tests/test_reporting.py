@@ -133,7 +133,7 @@ async def test_json_and_markdown_reports(tmp_path, patched_collectors):
     assert len(report.module_results()) == 14
 
     doc = json.loads((tmp_path / "example.com/report.json").read_text())
-    assert doc["schema_version"] == "2.0" and doc["scan_id"]
+    assert doc["schema_version"] == "2.1" and doc["scan_id"]
     assert doc["target"]["hostname"] == "example.com"
     assert doc["network"]["status"] == "failed" and doc["network"]["data"] is None
     assert "body" not in doc["http"]["data"]["probes"][0]   # raw bodies never serialized
