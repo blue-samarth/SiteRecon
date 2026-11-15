@@ -679,6 +679,299 @@ class TlsProtocolEnumCheck(ActiveCheck):
                 pass
 
 
+class PortScanCheck(ActiveCheck):
+    '''
+    Checks which operator-listed TCP ports accept connections on in-scope hosts.
+
+    A bounded TCP connect scan: one connection attempt per operator-listed port, classified open/closed/
+    filtered. Only ports the operator named (explicitly or via a profile) are probed, and no banner is
+    grabbed — service names come from a static well-known-port map, not from the response — so this is a
+    reachability inventory, not aggressive fingerprinting.
+    '''
+
+    check_id: ClassVar[str] = "port_scan"
+    description: ClassVar[str] = ("Attempts one bounded TCP connect per operator-listed port on each in-scope "
+                                  "host, recording open/closed/filtered with conservative service identification.")
+
+    WELL_KNOWN: ClassVar[dict[int, str]] = {
+        20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http", 110: "pop3",
+        111: "rpcbind", 135: "msrpc", 139: "netbios", 143: "imap", 443: "https", 445: "smb", 465: "smtps",
+        587: "submission", 993: "imaps", 995: "pop3s", 1433: "mssql", 1521: "oracle", 2049: "nfs",
+        3306: "mysql", 3389: "rdp", 5432: "postgres", 5900: "vnc", 5984: "couchdb", 6379: "redis",
+        8080: "http-alt", 8443: "https-alt", 9200: "elasticsearch", 11211: "memcached", 27017: "mongodb"}
+    # Ports fronting services that are usually not meant to be internet-facing (databases, admin, sharing).
+    SENSITIVE: ClassVar[dict[int, str]] = {
+        22: "SSH", 23: "Telnet", 135: "MS-RPC", 139: "NetBIOS", 445: "SMB", 1433: "MSSQL", 1521: "Oracle",
+        2049: "NFS", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 6379: "Redis",
+        9200: "Elasticsearch", 11211: "Memcached", 27017: "MongoDB"}
+
+    def __init__(self, timeout: float = 3.0) -> None:
+        '''
+        Create the check.
+        Parameters:
+            timeout (float): Per-connection timeout in seconds.
+        '''
+        self.timeout = timeout
+
+    def prerequisites(self, auth: AuthorizationFile) -> str | None:
+        '''
+        Require at least one listed port-scan target whose host is in scope.
+        Parameters:
+            auth (AuthorizationFile): The authorization.
+        Returns:
+            str | None: Skip reason, or None.
+        '''
+        if not auth.port_scan_targets:
+            return "no 'port_scan_targets' listed in the authorization"
+        if not any(auth.scope.allows(t.host) for t in auth.port_scan_targets):
+            return "none of the listed port_scan_targets have a host in scope.hosts"
+        return None
+
+    async def run(self, ctx: ActiveContext) -> ActiveCheckResult:
+        '''
+        Connect-scan each in-scope target's authorized ports and flag the ones that are open.
+        Parameters:
+            ctx (ActiveContext): Shared context (budget/rate also cover each connection).
+        Returns:
+            ActiveCheckResult: Findings for hosts with open ports.
+        '''
+        started = datetime.now(UTC)
+        findings: list[Finding] = []
+        errors: list[CollectionError] = []
+        start_count = ctx.check_count(self.check_id)
+        for target in ctx.auth.port_scan_targets:
+            if not ctx.auth.scope.allows(target.host):
+                continue
+            open_ports: dict[int, str] = {}
+            for port in target.resolved_ports():
+                try:
+                    await ctx.reserve_handshake(self.check_id)
+                except BudgetExceeded as exc:
+                    errors.append(CollectionError(module=self.check_id, target=target.host,
+                                                  error_type="budget_exceeded", message=str(exc)))
+                    break
+                state = await self._probe_port(target.host, port)
+                ctx.log_probe(self.check_id, "TCP", f"{target.host}:{port}", note=state)
+                if state == "open":
+                    open_ports[port] = self.WELL_KNOWN.get(port, "unknown")
+            if open_ports:
+                findings.extend(self._port_findings(target.host, open_ports))
+        requests = ctx.check_count(self.check_id) - start_count
+        status = ModuleStatus.PARTIAL if errors else ModuleStatus.SUCCESS
+        return self._result("port-scan hosts", started, status=status, findings=findings, requests=requests,
+                            errors=errors)
+
+    async def _probe_port(self, host: str, port: int) -> str:
+        '''
+        Resolve a host to a public address and connect-probe one port.
+
+        Connections are made only to a publicly routable address (the same SSRF guard the passive modules
+        apply); a host that resolves only to private/loopback/metadata space is reported as 'blocked'.
+        Parameters:
+            host (str): Hostname to probe.
+            port (int): TCP port.
+        Returns:
+            str: 'open', 'closed', 'filtered' or 'blocked'.
+        '''
+        from recon.utils import is_public_ip, system_resolve
+
+        try:
+            addresses = await system_resolve(host, port)
+        except OSError:
+            return "filtered"
+        vetted = next((a for a in addresses if is_public_ip(a)), None)
+        if vetted is None:
+            return "blocked"
+        return await self._connect(vetted, port)
+
+    async def _connect(self, ip: str, port: int) -> str:
+        '''
+        Open a TCP connection to a vetted address and classify the outcome.
+        Parameters:
+            ip (str): A publicly routable IP address.
+            port (int): TCP port.
+        Returns:
+            str: 'open' (connected), 'closed' (refused) or 'filtered' (timeout/unreachable).
+        '''
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=self.timeout)
+        except ConnectionRefusedError:
+            return "closed"
+        except (TimeoutError, OSError):
+            return "filtered"
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=2)
+        except (OSError, TimeoutError):
+            pass
+        return "open"
+
+    def _port_findings(self, host: str, open_ports: dict[int, str]) -> list[Finding]:
+        '''
+        Build the open-ports inventory finding and, if any sensitive service is reachable, a flagged one.
+        Parameters:
+            host (str): The scanned host.
+            open_ports (dict[int, str]): Open port to service name.
+        Returns:
+            list[Finding]: One or two findings.
+        '''
+        listing = ", ".join(f"{p}/{svc}" for p, svc in sorted(open_ports.items()))
+        out: list[Finding] = [self._finding(
+            "active.open_ports", host, title=f"Open TCP ports on {host}",
+            description="A bounded TCP connect scan found these ports accepting connections. Only "
+                        "operator-listed ports were probed and no banners were grabbed; confirm each is "
+                        "intended to be reachable from the internet.",
+            severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"open: {listing}"],
+            source="TCP connect scan (operator-listed ports)")]
+        sensitive = {p: self.SENSITIVE[p] for p in open_ports if p in self.SENSITIVE}
+        if sensitive:
+            names = ", ".join(f"{p} ({n})" for p, n in sorted(sensitive.items()))
+            out.append(self._finding(
+                "active.sensitive_port_exposed", host, title="Sensitive service port reachable from the internet",
+                description="These ports front services that are usually not meant to be internet-facing "
+                            "(databases, remote administration, file sharing). Reachability is not proof of a "
+                            "vulnerability, but such services normally belong behind a firewall/VPN or an IP "
+                            "allow-list.",
+                severity=S.MEDIUM, confidence=C.MEDIUM, evidence=[f"reachable: {names}"],
+                source="TCP connect scan (operator-listed ports)"))
+        return out
+
+
+class TracerouteCheck(ActiveCheck):
+    '''
+    Discovers the network path toward operator-listed in-scope hosts using the system traceroute utility.
+
+    The result is a point-in-time path observation (hops may not respond, and the path can change), not
+    proof of the complete physical routing topology. The utility is run with a bounded hop count toward a
+    vetted public address only; if no traceroute binary is available the check records an error and
+    continues.
+    '''
+
+    check_id: ClassVar[str] = "traceroute"
+    description: ClassVar[str] = ("Runs a bounded traceroute toward each in-scope host and records the network "
+                                  "path (hops and round-trip times).")
+
+    def __init__(self, timeout: float = 5.0) -> None:
+        '''
+        Create the check.
+        Parameters:
+            timeout (float): Per-hop wait in seconds (also bounds the overall run).
+        '''
+        self.timeout = timeout
+
+    def prerequisites(self, auth: AuthorizationFile) -> str | None:
+        '''
+        Require at least one listed traceroute target whose host is in scope.
+        Parameters:
+            auth (AuthorizationFile): The authorization.
+        Returns:
+            str | None: Skip reason, or None.
+        '''
+        if not auth.traceroute_targets:
+            return "no 'traceroute_targets' listed in the authorization"
+        if not any(auth.scope.allows(t.host) for t in auth.traceroute_targets):
+            return "none of the listed traceroute_targets have a host in scope.hosts"
+        return None
+
+    async def run(self, ctx: ActiveContext) -> ActiveCheckResult:
+        '''
+        Trace the path to each in-scope target and record it as one finding per reachable target.
+        Parameters:
+            ctx (ActiveContext): Shared context (each traceroute counts as one probe against the budget).
+        Returns:
+            ActiveCheckResult: One informational path finding per target that produced hops.
+        '''
+        started = datetime.now(UTC)
+        findings: list[Finding] = []
+        errors: list[CollectionError] = []
+        start_count = ctx.check_count(self.check_id)
+        for target in ctx.auth.traceroute_targets:
+            if not ctx.auth.scope.allows(target.host):
+                continue
+            ip = await self._vetted_ip(target.host)
+            if ip is None:
+                errors.append(CollectionError(module=self.check_id, target=target.host,
+                                              error_type="blocked_address",
+                                              message="host did not resolve to a public address"))
+                continue
+            try:
+                await ctx.reserve_handshake(self.check_id)   # one probe per traceroute operation
+            except BudgetExceeded as exc:
+                errors.append(CollectionError(module=self.check_id, target=target.host,
+                                              error_type="budget_exceeded", message=str(exc)))
+                break
+            hops = await self._trace(ip, target.max_hops)
+            ctx.log_probe(self.check_id, "TRACE", f"{target.host} ({ip})",
+                          note=f"{len(hops)} hop(s)" if hops else "no path / unavailable")
+            if hops is None:
+                errors.append(CollectionError(module=self.check_id, target=target.host,
+                                              error_type="traceroute_unavailable",
+                                              message="traceroute utility not available or failed"))
+                continue
+            if hops:
+                findings.append(self._finding(
+                    "active.network_path", target.host, title=f"Network path to {target.host}",
+                    description="The route packets took toward this host, as reported by the system traceroute "
+                                "utility. This is a point-in-time path observation — hops may not respond and the "
+                                "path can change — not proof of the complete physical topology.",
+                    severity=S.INFORMATIONAL, confidence=C.MEDIUM, evidence=hops[:40],
+                    source=f"system traceroute toward {ip} (max {target.max_hops} hops)"))
+        requests = ctx.check_count(self.check_id) - start_count
+        status = ModuleStatus.PARTIAL if errors else ModuleStatus.SUCCESS
+        return self._result("traceroute hosts", started, status=status, findings=findings, requests=requests,
+                            errors=errors)
+
+    @staticmethod
+    async def _vetted_ip(host: str) -> str | None:
+        '''
+        Resolve a host and return its first publicly routable address, or None.
+        Parameters:
+            host (str): Hostname to resolve.
+        Returns:
+            str | None: A public IP, or None if it resolves only to private/blocked space or not at all.
+        '''
+        from recon.utils import is_public_ip, system_resolve
+
+        try:
+            addresses = await system_resolve(host, 0)
+        except OSError:
+            return None
+        return next((a for a in addresses if is_public_ip(a)), None)
+
+    async def _trace(self, ip: str, max_hops: int) -> list[str] | None:
+        '''
+        Run the system traceroute toward a vetted IP and return its hop lines, or None if it was unavailable.
+
+        The address is passed as an argument (never a shell string), and only to a vetted public IP, so no
+        untrusted input reaches a shell and no private destination is traced.
+        Parameters:
+            ip (str): A vetted public IP address.
+            max_hops (int): Maximum hops.
+        Returns:
+            list[str] | None: Per-hop lines (header dropped), or None if the binary is missing or it failed.
+        '''
+        import sys
+
+        if sys.platform.startswith("win"):
+            cmd = ["tracert", "-d", "-h", str(max_hops), "-w", str(int(self.timeout * 1000)), ip]
+        else:
+            cmd = ["traceroute", "-n", "-q", "1", "-m", str(max_hops), "-w", str(max(1, int(self.timeout))), ip]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.timeout * max_hops + 10)
+        except TimeoutError:
+            proc.kill()
+            return None
+        if proc.returncode not in (0, None):
+            return None
+        lines = out.decode("utf-8", "replace").splitlines()
+        return [ln.strip() for ln in lines[1:] if ln.strip()][:max_hops]   # drop the "traceroute to …" header
+
+
 # Deprecated import alias: the Supabase row-level-security check was reframed as the backend-agnostic
 # BackendReadAccessCheck. Kept so `from recon.active.checks import SupabaseRlsCheck` keeps importing.
 SupabaseRlsCheck = BackendReadAccessCheck
@@ -690,6 +983,8 @@ REGISTRY: dict[str, type[ActiveCheck]] = {
     ClientIpHeaderTrustCheck.check_id: ClientIpHeaderTrustCheck,
     EmailEndpointRateLimitCheck.check_id: EmailEndpointRateLimitCheck,
     TlsProtocolEnumCheck.check_id: TlsProtocolEnumCheck,
+    PortScanCheck.check_id: PortScanCheck,
+    TracerouteCheck.check_id: TracerouteCheck,
 }
 
 

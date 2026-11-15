@@ -1,11 +1,3 @@
-'''
-Pydantic schemas shared by every layer (collection, analysis, reporting).
-
-Import from this package rather than individual submodules, e.g.
-``from recon.models import DnsData, ReconReport``. Submodules inside this package
-import each other directly to avoid circular imports.
-'''
-
 from recon.models.assets import (
     AssetData,
     AssetRecord,
@@ -59,6 +51,7 @@ from recon.models.report import (
     SCHEMA_VERSION,
     AnalysisResult,
     Finding,
+    FindingDelta,
     InfrastructureObservation,
     ReconReport,
     TargetInfo,
@@ -82,7 +75,7 @@ __all__ = [
     # network
     "AsnInfo", "GeoLocation", "IpIntel", "NetworkData", "RdapNetwork",
     # report / analysis output
-    "SCHEMA_VERSION", "AnalysisResult", "Finding", "InfrastructureObservation", "ReconReport",
+    "SCHEMA_VERSION", "AnalysisResult", "Finding", "FindingDelta", "InfrastructureObservation", "ReconReport",
     "TargetInfo", "ToolInfo",
     # subdomains / technology / third party / tls / whois
     "SubdomainData", "SubdomainRecord", "DetectionStatus", "TechEvidence", "Technology",

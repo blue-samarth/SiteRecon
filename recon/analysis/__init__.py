@@ -9,6 +9,8 @@ from recon.analysis.engine import (
     InfrastructureInference,
 )
 from recon.analysis.comparison import ScanComparator
+from recon.analysis.correlation import calibrate, correlate
+from recon.analysis.regression import ChangeAnalyzer, RegressionAnalyzer
 from recon.analysis.findings import LIMITATIONS, RECOMMENDATIONS, FindingCollector
 from recon.analysis.observations import ObservationBuilder
 from recon.analysis.signatures import (
@@ -39,7 +41,8 @@ from recon.analysis.trackers import (
 from recon.analysis.waf import WAF_SIGNATURES, WafDetection, WafSignature, detect_wafs
 
 __all__ = [
-    "AnalysisEngine", "InfrastructureInference", "FindingCollector", "ScanComparator", "ObservationBuilder",
+    "AnalysisEngine", "InfrastructureInference", "FindingCollector", "ScanComparator", "RegressionAnalyzer",
+    "ChangeAnalyzer", "ObservationBuilder", "correlate", "calibrate",
     "RECOMMENDATIONS", "LIMITATIONS",
     "DOMAIN_EXPIRY_WARN_DAYS", "HOLD_STATUSES", "HSTS_RECOMMENDED_MAX_AGE", "LEGACY_TLS",
     "TLS_EXPIRY_URGENT_DAYS", "TLS_EXPIRY_WARN_DAYS",

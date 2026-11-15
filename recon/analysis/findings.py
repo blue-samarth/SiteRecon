@@ -89,6 +89,15 @@ RECOMMENDATIONS: dict[str, str] = {
     "active.no_rate_limit": "Add per-IP/per-account rate limiting and abuse controls to this endpoint.",
     "active.legacy_tls_accepted": "Disable TLS 1.0 and 1.1 at the server/load balancer; require TLS 1.2+.",
     "active.tls_versions": "Confirm only the intended TLS versions are accepted (prefer TLS 1.2 and 1.3 only).",
+    "active.open_ports": "Confirm each open port is intended to be internet-facing; firewall or close the ones that are not.",
+    "active.sensitive_port_exposed": "Place databases, remote-administration and file-sharing services behind a firewall/VPN or an IP allow-list instead of exposing them to the internet; verify authentication and patching.",
+    "active.network_path": "Informational network-path observation; no action required.",
+    "regression.security_header_removed": "Restore the removed security header unless its removal was intended and reviewed.",
+    "regression.cookie_weakened": "Restore the Secure/HttpOnly attributes on this cookie; dropping them weakens its protection.",
+    "regression.tls_downgrade": "Investigate why a lower TLS version is being negotiated and restore the stronger configuration.",
+    "regression.dnssec_disabled": "If DNSSEC was disabled unintentionally, re-sign the zone and publish the DS record.",
+    "regression.caa_removed": "Re-publish a CAA policy restricting which certificate authorities may issue for the domain, unless the removal was intentional.",
+    "regression.new_subdomain": "Confirm the new hostname is intended and inventoried; unexpected names can indicate shadow IT or takeover setups.",
     "active.client_ip_header_bypass": "Derive the client IP from the trusted proxy connection only; strip inbound "
                                       "X-Forwarded-For/X-Real-IP at the edge and do not key access or rate limits on "
                                       "client-supplied headers.",
@@ -125,6 +134,7 @@ LIMITATIONS: dict[str, str] = {
     "waf.": "Passive identification from headers, cookies and the server banner only; absence of a signature does not prove there is no WAF, and a CDN/proxy signal does not prove WAF rules are enabled.",
     "hosting.": "An estimate from registry allocation and an optional offline geo database; it reflects where the address space is registered, not the physical server, and is not meaningful behind a CDN/anycast network.",
     "intel.": "Retrieved from a third-party provider; it reflects that provider's data about the IP/domain — which may be historical or stale — not a live observation by SiteRecon, and discloses the target to that provider.",
+    "regression.": "A change observed between this scan and the previous one; it reflects the two compared scans, and a change is reported only when the relevant module ran successfully in both.",
 }
 
 _CATEGORY_MODULES: dict[str, tuple[str, ...]] = {

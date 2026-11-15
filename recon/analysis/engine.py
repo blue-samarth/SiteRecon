@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import datetime
 from urllib.parse import urlsplit
 
+from recon.analysis.correlation import calibrate, correlate
 from recon.analysis.findings import FindingCollector
 from recon.analysis.tech_signatures import SIGNATURES_VERSION
 from recon.analysis.trackers import PRIVACY_SENSITIVE, TrackerCategory, classify_tracker
@@ -156,7 +157,8 @@ class AnalysisEngine:
 
         infrastructure: list[InfrastructureObservation] = InfrastructureInference.infer(
             network=network, dns=dns, http=http)
-        ordered: list[Finding] = findings.sorted()
+        ordered: list[Finding] = correlate(findings.sorted())   # merge same-issue duplicates across modules
+        calibrate(ordered, observations or [])                  # weaken findings backed only by stale external data
         counts: Counter[str] = Counter(f.severity.value for f in ordered)
 
         return AnalysisResult(findings=ordered, infrastructure=infrastructure,

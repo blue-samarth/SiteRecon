@@ -97,6 +97,77 @@ class EmailEndpointTarget(BaseModel):
     def _cap_burst(cls, value: int) -> int: return max(1, min(value, 10))
 
 
+# Predefined port profiles the operator can name instead of listing ports by hand.
+PORT_PROFILES: dict[str, tuple[int, ...]] = {
+    "web": (80, 443, 8080, 8443),
+    "common": (21, 22, 23, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 3389, 5432, 8080, 8443),
+    "database": (1433, 1521, 3306, 5432, 5984, 6379, 9200, 11211, 27017),
+    "remote": (22, 23, 3389, 5900),
+}
+
+
+class PortScanTarget(BaseModel):
+    '''
+    A host to port-scan, with the exact ports the operator authorized (explicit ports and/or a named profile).
+    '''
+    host: str
+    ports: list[int] = Field(default_factory=list)
+    profile: str | None = None
+
+    @field_validator("ports")
+    @classmethod
+    def _check_ports(cls, value: list[int]) -> list[int]:
+        '''
+        Keep only valid port numbers, de-duplicated, and cap the count so a scan stays bounded.
+        Parameters:
+            value (list[int]): Requested ports.
+        Returns:
+            list[int]: Valid, sorted, unique ports (at most 1024).
+        Raises:
+            ValueError: If more than 1024 valid ports are listed.
+        '''
+        cleaned = sorted({p for p in value if 1 <= p <= 65535})
+        if len(cleaned) > 1024:
+            raise ValueError("at most 1024 ports per host")
+        return cleaned
+
+    @field_validator("profile")
+    @classmethod
+    def _check_profile(cls, value: str | None) -> str | None:
+        '''
+        Reject an unknown port profile name.
+        Parameters:
+            value (str | None): The profile name.
+        Returns:
+            str | None: The profile name, or None.
+        Raises:
+            ValueError: If the profile is not one of PORT_PROFILES.
+        '''
+        if value is not None and value not in PORT_PROFILES:
+            raise ValueError(f"unknown port profile {value!r}; known: {', '.join(sorted(PORT_PROFILES))}")
+        return value
+
+    def resolved_ports(self) -> list[int]:
+        '''
+        The concrete ports to probe: the explicit ports unioned with any named profile.
+        Returns:
+            list[int]: Sorted, unique ports.
+        '''
+        return sorted(set(self.ports) | set(PORT_PROFILES.get(self.profile or "", ())))
+
+
+class TracerouteTarget(BaseModel):
+    '''
+    A host to trace the network path toward, with a bounded hop count.
+    '''
+    host: str
+    max_hops: int = 20
+
+    @field_validator("max_hops")
+    @classmethod
+    def _cap_hops(cls, value: int) -> int: return max(1, min(value, 30))
+
+
 class SupabaseTarget(BaseModel):
     '''
     A Supabase project to check for row-level-security enforcement using its public anon key only.
@@ -404,6 +475,8 @@ class AuthorizationFile(BaseModel):
     function_urls: list[FunctionUrlTarget] = Field(default_factory=list)
     email_endpoints: list[EmailEndpointTarget] = Field(default_factory=list)
     ip_trust_endpoints: list[IpTrustTarget] = Field(default_factory=list)
+    port_scan_targets: list[PortScanTarget] = Field(default_factory=list)
+    traceroute_targets: list[TracerouteTarget] = Field(default_factory=list)
 
     @field_validator("rate_limit_rps")
     @classmethod
@@ -612,5 +685,11 @@ def redact_authorization(auth: AuthorizationFile) -> dict[str, Any]:
 
     if auth.ip_trust_endpoints:
         summary["ip_trust_endpoints"] = [{"url": redact_url(t.url), "method": t.method, "access_control": t.access_control} for t in auth.ip_trust_endpoints]
+
+    if auth.port_scan_targets:
+        summary["port_scan_targets"] = [{"host": t.host, "ports": t.resolved_ports(), "profile": t.profile} for t in auth.port_scan_targets]
+
+    if auth.traceroute_targets:
+        summary["traceroute_targets"] = [{"host": t.host, "max_hops": t.max_hops} for t in auth.traceroute_targets]
 
     return summary

@@ -1,0 +1,35 @@
+# Fully-automated active-testing authorization for CI (no per-run human step).
+#
+# Commit this file once (reviewed in a PR — that is the one-time human gate). CI then runs:
+#   siterecon active clusterheart.com --authorization auth.ci.yaml --format json --fail-on high
+# every pipeline run, with zero human interaction.
+#
+# auto_discover is a STANDING assertion that you own the listed registrable domains. Each run passively
+# discovers first-party assets under them and runs the safe checks automatically — picking up new in-scope
+# endpoints as they appear. Third-party hosts found in your site (analytics, CDNs, someone else's API or
+# Supabase project) are reported but NEVER tested. Email bursting is never auto-enabled.
+
+target: clusterheart.com
+authorized_by: "CI — SiteRecon pipeline"
+authorized_on: "2026-11-11"
+
+# Standing window for recurring runs. Keep it wide (or roll it in CI); testing is refused outside it.
+window:
+  start: "2026-11-01T00:00:00Z"
+  end: "2027-11-01T00:00:00Z"
+
+rate_limit_rps: 1.0
+max_requests: 200
+max_requests_per_check: 50
+
+# The ownership boundary: only hosts whose registrable domain is listed here are ever actively tested.
+auto_discover:
+  authorized_domains:
+    - clusterheart.com
+  # checks: [tls_protocol_enum, function_url_reachability, external_intelligence]   # optional; this is the default safe set
+
+# scope / checks_enabled are synthesized each run from the passive scan — no need to list them by hand.
+#
+# NOT auto-enabled (add here only with the required human-set safety fields):
+#   backend_read_access      — needs a public credential (increment 2)
+#   email_endpoint_rate_limit — needs confirmed_no_real_delivery; never auto-bursts a real recipient

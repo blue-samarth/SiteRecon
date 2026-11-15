@@ -145,7 +145,7 @@ def _report_with_backend():
 def test_complete_mode_adds_embedded_backend_ip_trust_and_full_checks():
     s = synthesize(AUTO, target="clusterheart.com", report=_report_with_backend(), complete=True)
     assert s.checks == ["tls_protocol_enum", "function_url_reachability", "client_ip_header_trust",
-                        "backend_read_access", "external_intelligence"]
+                        "backend_read_access", "port_scan", "traceroute", "external_intelligence"]
     assert "email_endpoint_rate_limit" not in s.checks            # never
     assert [(b.kind, b.host, b.resources) for b in s.backends] == [("supabase", SUPA_HOST, ["profiles"])]
     assert s.backends[0].credential == ANON                       # retained public key used
@@ -157,6 +157,16 @@ def test_complete_mode_adds_embedded_backend_ip_trust_and_full_checks():
 def test_default_mode_does_not_synthesize_backends():
     s = synthesize(AUTO, target="clusterheart.com", report=_report_with_backend(), complete=False)
     assert s.backends == [] and "backend_read_access" not in s.checks and s.ip_trust_endpoints == []
+    assert s.port_scan_targets == [] and s.traceroute_targets == []   # network checks are complete-mode only
+
+
+def test_complete_mode_scans_and_traces_first_party_hosts():
+    s = synthesize(AUTO, target="clusterheart.com", report=_report_with_backend(), complete=True)
+    assert "port_scan" in s.checks and "traceroute" in s.checks
+    scanned = {t.host for t in s.port_scan_targets}
+    assert scanned == {"clusterheart.com", "api.clusterheart.com"}   # first-party only; stripe not scanned
+    assert all(t.profile == "common" for t in s.port_scan_targets)
+    assert {t.host for t in s.traceroute_targets} == scanned
 
 
 def test_anon_key_retained_only_with_flag():
@@ -168,14 +178,26 @@ def test_anon_key_retained_only_with_flag():
     assert not kept.sensitive and kept.value == ANON
 
 
-def test_bypass_sec_requires_auto_discover(tmp_path):
+MINIMAL = ("target: clusterheart.com\nauthorized_by: x\nauthorized_on: \"2026-11-13\"\n"
+           "window: {start: \"2026-11-10T00:00:00Z\", end: \"2026-12-01T00:00:00Z\"}\n")
+
+
+def test_bypass_sec_works_with_a_minimal_auth(tmp_path):
+    # no auto_discover, no scope — --bypass-sec derives everything from the target; dry-run accepts it
     plain = tmp_path / "plain.yaml"
-    plain.write_text("target: clusterheart.com\nauthorized_by: x\nauthorized_on: \"2026-11-13\"\n"
-                     "window: {start: \"2026-11-10T00:00:00Z\", end: \"2026-12-01T00:00:00Z\"}\n"
-                     "scope: {hosts: [clusterheart.com]}\nchecks_enabled: [external_intelligence]\n", encoding="utf-8")
-    res = runner.invoke(app, ["active", "clusterheart.com", "-A", str(plain), "--bypass-sec",
+    plain.write_text(MINIMAL, encoding="utf-8")
+    res = runner.invoke(app, ["active", "clusterheart.com", "-A", str(plain), "--bypass-sec", "--dry-run",
                               "--now", "2026-11-13T12:00:00Z"])
-    assert res.exit_code == 2 and "requires an auto_discover" in res.output
+    assert res.exit_code == 0, res.output
+    assert "bypass-sec" in " ".join(res.output.split())
+
+
+def test_bypass_sec_needs_the_passive_scan(tmp_path):
+    plain = tmp_path / "plain.yaml"
+    plain.write_text(MINIMAL, encoding="utf-8")
+    res = runner.invoke(app, ["active", "clusterheart.com", "-A", str(plain), "--bypass-sec", "--no-passive",
+                              "--now", "2026-11-13T12:00:00Z"])
+    assert res.exit_code == 2 and "needs the passive scan" in " ".join(res.output.split())
 
 
 def test_cli_dry_run_reports_auto_discover(tmp_path):

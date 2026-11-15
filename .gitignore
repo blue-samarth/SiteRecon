@@ -6,6 +6,8 @@ __pycache__/
 
 # local engagement authorization — never commit (real target/authorizer)
 auth.yaml
+auth.*.yaml
+!auth.ci.yaml
 
 # generated source dump
 all_python_files.txt
