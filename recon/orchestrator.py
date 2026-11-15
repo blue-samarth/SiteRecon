@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from time import perf_counter
@@ -20,7 +21,14 @@ from typing import Any, ClassVar, TypeVar
 from urllib.parse import urlsplit
 
 from recon import TOOL_NAME, __version__
-from recon.analysis import SIGNATURES_VERSION, AnalysisEngine, ObservationBuilder, ScanComparator
+from recon.analysis import (
+    SIGNATURES_VERSION,
+    AnalysisEngine,
+    ChangeAnalyzer,
+    ObservationBuilder,
+    RegressionAnalyzer,
+    ScanComparator,
+)
 from recon.config import ALL_MODULES, Config
 from recon.models import (
     AnalysisResult,
@@ -29,6 +37,7 @@ from recon.models import (
     ModuleResult,
     ModuleStatus,
     ReconReport,
+    Severity,
     TargetInfo,
     ToolInfo,
     utcnow,
@@ -367,8 +376,11 @@ class ScanHistory:
     def record(self, report: ReconReport) -> str:
         '''
         Compare with the latest stored scan of the same target (if any), then save this scan.
+
+        With no previous scan the report is saved as-is (first run); with one, its observation comparison,
+        interpreted change findings and finding delta (new/persisting/resolved) are attached in place.
         Parameters:
-            report (ReconReport): The new report; its comparison field is set in place.
+            report (ReconReport): The new report; its comparison/finding_changes are set in place.
         Returns:
             str: Where the scan was stored.
         Raises:
@@ -381,4 +393,11 @@ class ScanHistory:
             previous = None
         if previous is not None:
             report.comparison = ScanComparator.compare(previous, report)
+            changes = ChangeAnalyzer.analyze(report.comparison, report.finished_at)
+            if changes:  # merge named regressions into the findings before computing the delta
+                report.analysis.findings = sorted([*report.analysis.findings, *changes],
+                                                  key=lambda f: (-f.severity.rank, f.category, f.id))
+                counts = Counter(f.severity.value for f in report.analysis.findings)
+                report.analysis.severity_counts = {s.value: counts.get(s.value, 0) for s in Severity}
+            report.finding_changes = RegressionAnalyzer.analyze(previous, report)
         return self.store.save(report)

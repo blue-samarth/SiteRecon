@@ -26,7 +26,9 @@ from recon.active.authorization import (
     FirebaseBackend,
     FunctionUrlTarget,
     IpTrustTarget,
+    PortScanTarget,
     SupabaseBackend,
+    TracerouteTarget,
 )
 from recon.models import ReconReport
 from recon.utils import registrable_domain
@@ -35,7 +37,9 @@ from recon.utils import registrable_domain
 DEFAULT_SAFE_CHECKS: tuple[str, ...] = ("tls_protocol_enum", "function_url_reachability", "external_intelligence")
 # Checks run in complete mode (local --bypass-sec): everything EXCEPT email bursting.
 COMPLETE_CHECKS: tuple[str, ...] = ("tls_protocol_enum", "function_url_reachability", "client_ip_header_trust",
-                                    "backend_read_access", "external_intelligence")
+                                    "backend_read_access", "port_scan", "traceroute", "external_intelligence")
+# Default port profile used when complete mode synthesizes a port scan of first-party hosts.
+_AUTO_PORT_PROFILE = "common"
 _FUNCTION_URL_CAP = 25
 _SUPABASE_TABLE: re.Pattern[str] = re.compile(r"/rest/v1/([A-Za-z0-9_]+)")
 
@@ -50,6 +54,8 @@ class Synthesis:
     function_urls: list[FunctionUrlTarget] = field(default_factory=list)
     ip_trust_endpoints: list[IpTrustTarget] = field(default_factory=list)
     backends: list[Backend] = field(default_factory=list)
+    port_scan_targets: list[PortScanTarget] = field(default_factory=list)
+    traceroute_targets: list[TracerouteTarget] = field(default_factory=list)
     checks: list[str] = field(default_factory=list)
     third_party_hosts: list[str] = field(default_factory=list)
 
@@ -135,6 +141,12 @@ def synthesize(auto: AutoDiscover, *, target: str, report: ReconReport | None,
     backends: list[Backend] = (list(_supabase_backends(assets, supabase_tables))
                                if complete and assets is not None else [])
 
+    # Complete mode also scans and traces the first-party hosts (the target plus any first-party endpoint
+    # hosts) — the network checks the safe/CI set deliberately leaves out.
+    first_party_hosts = sorted(tls_hosts | {h for f in urls if (h := urlsplit(f.url).hostname) and first_party(h)})
+    port_scans = ([PortScanTarget(host=h, profile=_AUTO_PORT_PROFILE) for h in first_party_hosts] if complete else [])
+    traceroutes = ([TracerouteTarget(host=h) for h in first_party_hosts] if complete else [])
+
     # Backend hosts (the operator's own embedded Supabase/Firebase) join the scope so the check can reach them,
     # and are removed from the "third-party, not tested" list since they ARE tested as first-party backends.
     backend_hosts = {b.host for b in backends if isinstance(b, SupabaseBackend)} | {
@@ -145,11 +157,13 @@ def synthesize(auto: AutoDiscover, *, target: str, report: ReconReport | None,
     base_checks = list(auto.checks) or list(COMPLETE_CHECKS if complete else DEFAULT_SAFE_CHECKS)
     drop = {"function_url_reachability": not urls, "tls_protocol_enum": not tls_hosts,
             "client_ip_header_trust": not ip_trust, "backend_read_access": not backends,
+            "port_scan": not port_scans, "traceroute": not traceroutes,
             "email_endpoint_rate_limit": True}   # never auto-run email bursting
     checks = [c for c in base_checks if not drop.get(c, False)]
     return Synthesis(scope_hosts=scope_hosts or ([target] if first_party(target) else []),
                      tls_hosts=sorted(tls_hosts), function_urls=urls, ip_trust_endpoints=ip_trust,
-                     backends=backends, checks=checks, third_party_hosts=sorted(third_party))
+                     backends=backends, port_scan_targets=port_scans, traceroute_targets=traceroutes,
+                     checks=checks, third_party_hosts=sorted(third_party))
 
 
 def apply_synthesis(auth: AuthorizationFile, synthesis: Synthesis) -> AuthorizationFile:
@@ -171,4 +185,6 @@ def apply_synthesis(auth: AuthorizationFile, synthesis: Synthesis) -> Authorizat
         "function_urls": [*auth.function_urls, *synthesis.function_urls],
         "ip_trust_endpoints": [*auth.ip_trust_endpoints, *synthesis.ip_trust_endpoints],
         "backends": [*auth.backends, *synthesis.backends],
+        "port_scan_targets": [*auth.port_scan_targets, *synthesis.port_scan_targets],
+        "traceroute_targets": [*auth.traceroute_targets, *synthesis.traceroute_targets],
         "checks_enabled": checks})

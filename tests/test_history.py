@@ -125,6 +125,28 @@ def test_scan_history_attaches_comparison(tmp_path):
     assert second.comparison.counts["unchanged"] > 0 and second.comparison.changes == []
 
 
+def test_scan_history_tracks_finding_lifecycle(tmp_path):
+    from recon.models import Finding
+    from recon.models.common import Confidence, FindingState, Severity
+
+    def f(fid):
+        return Finding(id=fid, category="dns", title="t", description="d", severity=Severity.HIGH,
+                       confidence=Confidence.HIGH, source="s", subject="sub", timestamp=T0)
+
+    history = ScanHistory(JsonScanStore(tmp_path))
+    first = report("20260101T000000Z-aaaaaa", dns=_dns())
+    first.analysis.findings = [f("dns.a:x"), f("dns.gone:x")]
+    history.record(first)
+    second = report("20260102T000000Z-bbbbbb", dns=_dns(), started=T0 + dt.timedelta(days=1))
+    second.analysis.findings = [f("dns.a:x"), f("dns.new:x")]
+    history.record(second)
+    assert second.finding_changes is not None
+    assert second.finding_changes.new == ["dns.new:x"]
+    # dns ran SUCCESS this scan, so the disappearance of dns.gone is a real resolution
+    assert [r.id for r in second.finding_changes.resolved] == ["dns.gone:x"]
+    assert next(x for x in second.analysis.findings if x.id == "dns.a:x").state is FindingState.CORROBORATED
+
+
 def test_observation_ids_are_stable():
     a = report("20260101T000000Z-aaaaaa", dns=_dns())
     b = report("20260102T000000Z-bbbbbb", dns=_dns())

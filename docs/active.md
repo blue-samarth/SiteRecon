@@ -87,20 +87,41 @@ whereas `auto_discover` runs the same discovery non-interactively within a commi
 
 #### A complete local run (`--bypass-sec`)
 
-The CI default is the safe set (no credentials needed). For a **local** complete run of your own system,
-add `--bypass-sec` to an `auto_discover` run:
+For a **local** complete run of your own system, `--bypass-sec` does the discovery and authorization for
+you — it needs only a **minimal** authorization (who, when, the window, and the limits):
 
-```bash
-siterecon active clusterheart.com --authorization auth.ci.yaml --bypass-sec --format all
+```yaml
+target: example.com
+authorized_by: "You"
+authorized_on: "2026-11-15"
+window: { start: "2026-11-01T00:00:00Z", end: "2027-11-01T00:00:00Z" }
+rate_limit_rps: 2.0
+max_requests: 500
+max_requests_per_check: 100
 ```
 
-It runs the **complete** check set except email — `tls_protocol_enum`, `function_url_reachability`,
-`client_ip_header_trust`, `external_intelligence`, **and `backend_read_access`** — against your first-party
-hosts **and the backends your own site embeds**. To test the backend it keeps the public Supabase/Firebase
-key the passive scan found (normally redacted) and uses the table names it saw in `/rest/v1/<table>`
-references. Two things it still will not do: actively probe **unrelated** third-party hosts (Stripe,
-analytics, someone else's API — reported, never tested), or **burst email** endpoints. It requires an
-`auto_discover` block (for the ownership boundary) and is meant for local testing, not CI.
+```bash
+siterecon active example.com --authorization auth.yaml --bypass-sec --format all
+```
+
+It runs a passive scan, derives the scope from the target itself (**no `scope` or `auto_discover` to
+write**), and runs the **complete** check set except email — `tls_protocol_enum`,
+`function_url_reachability`, `client_ip_header_trust`, `backend_read_access`, `port_scan` and `traceroute`
+— across everything under the target's domain and the backends the site embeds. To test the backend it
+keeps the public Supabase/Firebase key the passive scan found (normally redacted) and uses the table names
+it saw in `/rest/v1/<table>` references. The boundary is the target's own registrable domain (so it does
+not actively probe unrelated third-party hosts like Stripe or analytics — those aren't yours to authorize),
+and it never **bursts email** (which could reach real recipients). You own the engagement and its SLAs;
+`--bypass-sec` is for local testing, not CI.
+
+**Run it with `sudo` for full network probing.** SiteRecon never escalates privileges itself — it uses
+whatever the process is given. The TCP connect scan works unprivileged, but `traceroute` (and, on some
+systems, fuller probing) needs raw-socket privileges; in a restricted environment (a container, a minimal
+CI image) an unprivileged `traceroute` is recorded as an error, not a crash. So for a complete local run:
+
+```bash
+sudo siterecon active example.com --authorization auth.yaml --bypass-sec --format all
+```
 
 ### Scaffolding a draft (optional)
 
@@ -165,6 +186,13 @@ ip_trust_endpoints:
   - url: "https://example.io/admin"
     method: GET
     access_control: true                # label: gates access/rate on client IP (raises severity)
+port_scan_targets:
+  - host: example.io
+    ports: [80, 443, 22]                # exact ports, and/or:
+    profile: web                        # one of: web, common, database, remote
+traceroute_targets:
+  - host: example.io
+    max_hops: 20                        # capped at 30
 external_intelligence:                  # only needed to restrict providers; the checks_enabled entry is enough
   providers: [wayback, shodan_internetdb]
 ```
@@ -190,6 +218,8 @@ omitted.
 | `backend_read_access` | One read-only probe per operator-listed backend **resource**, using **only** a public/client-side credential. No writes, no pagination. Each backend `kind` has its own probe and its own "open"/"denied" rule (see below). | 1 per resource | `active.backend_read_access_open` (high) when a resource returns data to the public credential — backend authorization (RLS / rules / role permissions) is not restricting anonymous reads. A denial produces **no** finding. |
 | `function_url_reachability` | One request per listed function URL with the configured method. GET/OPTIONS send no body; POST/PUT/PATCH send only an empty `{}` — never a payload that could create state. | 1 per URL | `active.endpoint_open` (high) when a URL you labeled `state_changing` answers an unauthenticated request; `active.endpoint_reachable` (info) otherwise. 401/403 → no finding. |
 | `email_endpoint_rate_limit` | A small, test-marked burst (`burst`, ≤10) paced at the engagement rate, **only** to endpoints with `confirmed_no_real_delivery: true`. Sends an `X-SiteRecon-Test` header and a test payload; skips any endpoint not confirmed safe. | ≤`burst` per endpoint | `active.no_rate_limit` (medium) when the whole burst is accepted with no 429/503. |
+| `port_scan` | One bounded TCP **connect** per operator-listed port on each in-scope host (explicit ports and/or a named profile: `web`, `common`, `database`, `remote`). No banners are grabbed; service names come from a static well-known-port map. Connections go only to vetted public addresses. | 1 per port | `active.open_ports` (info) lists reachable ports; `active.sensitive_port_exposed` (medium) when a database/admin/file-sharing port is internet-reachable. |
+| `traceroute` | A bounded `traceroute`/`tracert` (system utility) toward each in-scope host's vetted public IP, with a capped hop count. A point-in-time path observation, not proof of topology; missing a binary is recorded as an error, not a crash. | 1 per target | `active.network_path` (info) — the hops and round-trip times. |
 | `tls_protocol_enum` | A handshake at each of TLS 1.0/1.1/1.2/1.3 against hosts carrying the per-host `tls_authorized` opt-in. No application data is sent. The evidence lists **every version offered and its outcome** (accepted / offered-rejected / not-attempted), and each handshake appears in the audit log. | 1 per version per host | `active.legacy_tls_accepted` (medium) when TLS 1.0/1.1 is negotiable; `active.tls_versions` (info) otherwise. |
 | `external_intelligence` | Queries keyless third-party providers (Wayback Machine, Shodan InternetDB) **about** the target — its domain and resolved IPs — never the target itself. Discloses the target to those providers. See [intelligence.md](intelligence.md). | ≤1 per Wayback domain + 1 per IP (Shodan) | `intel.archived_history`/`intel.archived_sensitive_path` (info/low) from the web archive; `intel.exposed_ports` (info) and `intel.indexed_vulnerability` (low, candidates) from Shodan's index. |
 | `client_ip_header_trust` | A baseline request plus two copies with client-IP headers (`X-Forwarded-For`, `X-Real-IP`, `CF-Connecting-IP`, `Forwarded`, …) set to test values (`127.0.0.1`, `10.0.0.1`). **No packets are forged** — these are ordinary request headers. Endpoints are operator-listed in `ip_trust_endpoints` (never guessed). | 3 per endpoint | `active.access_control_open` (high) when an endpoint labeled `access_control` already answers the plain baseline without auth; `active.client_ip_header_bypass` (high) when the status flips a decision with the headers (e.g. 403→200, 429→200); `active.client_ip_header_trusted` (low) when it merely varies. |

@@ -26,9 +26,10 @@ from recon.models.third_party import ThirdPartyData
 from recon.models.tls import TlsData
 from recon.models.whois import DomainRegistration
 
-# 2.1 adds optional provenance/freshness fields to observations and a lifecycle `state` to findings; all
-# are additive with safe defaults, so reports written by 2.0 still load.
-SCHEMA_VERSION: str = "2.1"
+# 2.1 adds optional provenance/freshness fields to observations and a lifecycle `state` to findings.
+# 2.2 adds the optional `finding_changes` delta (new/persisting/resolved) since the previous scan. All are
+# additive with safe defaults, so reports written by older versions still load.
+SCHEMA_VERSION: str = "2.2"
 
 
 class Finding(BaseModel):
@@ -91,6 +92,30 @@ class AnalysisResult(BaseModel):
     severity_counts: dict[str, int] = Field(default_factory=dict)
 
 
+class FindingDelta(BaseModel):
+    '''
+    How findings changed since the previous scan: what is new (a regression or newly surfaced issue), what
+    persists, and what is resolved.
+
+    A finding absent from the current scan is counted as resolved ONLY when the module(s) that would
+    produce it ran successfully this time — a finding missing because its module failed or was skipped is
+    never reported as resolved. Resolved findings carry state RESOLVED and are kept here, out of the live
+    findings list.
+    '''
+    previous_scan_id: str
+    new: list[str] = Field(default_factory=list)          # finding ids new in this scan
+    persisting: list[str] = Field(default_factory=list)   # finding ids present in both scans
+    resolved: list[Finding] = Field(default_factory=list)  # findings gone since last scan (state=RESOLVED)
+
+    def counts(self) -> dict[str, int]:
+        '''
+        New / persisting / resolved counts for a one-line summary.
+        Returns:
+            dict[str, int]: Counts keyed 'new', 'persisting', 'resolved'.
+        '''
+        return {"new": len(self.new), "persisting": len(self.persisting), "resolved": len(self.resolved)}
+
+
 class ToolInfo(BaseModel):
     '''
     Tool identity recorded in the report.
@@ -148,7 +173,8 @@ class ReconReport(BaseModel):
     javascript: ModuleResult[AssetData] = Field(default_factory=_skipped("javascript"))
     observations: list[Observation] = Field(default_factory=list)
     analysis: AnalysisResult
-    comparison: ComparisonResult | None = None    # changes since the previous stored scan, if any
+    comparison: ComparisonResult | None = None    # observation-level changes since the previous stored scan
+    finding_changes: FindingDelta | None = None   # finding lifecycle (new/persisting/resolved) since previous scan
     errors: list[CollectionError] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 

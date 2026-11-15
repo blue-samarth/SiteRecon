@@ -22,6 +22,7 @@ from recon.active import (
     ActiveReport,
     AuthorizationError,
     AuthorizationFile,
+    AutoDiscover,
     apply_synthesis,
     build_authorization_draft,
     load_authorization,
@@ -43,7 +44,7 @@ from recon.reporting import (
     ReportWriter,
 )
 from recon.storage import JsonScanStore
-from recon.utils import InvalidTargetError, normalize_target, redact_url, setup_logging
+from recon.utils import InvalidTargetError, normalize_target, redact_url, registrable_domain, setup_logging
 
 app: typer.Typer = typer.Typer(add_completion=False, no_args_is_help=True, rich_markup_mode="rich")
 console: Console = Console()
@@ -113,6 +114,14 @@ def scan(
     asset_host: Annotated[list[str] | None, typer.Option(
         "--asset-host", help="External host allowed for asset downloads (repeatable; e.g. a CDN you operate).")] = None,
     history: Annotated[bool, typer.Option("--history/--no-history", help="Store the scan and compare with the previous one.")] = True,
+    fail_on: Annotated[Severity | None, typer.Option("--fail-on",
+                                                     help="Exit non-zero (code 3) if any finding is at least "
+                                                          "this severity. For CI gating.")] = None,
+    fail_on_new: Annotated[Severity | None, typer.Option("--fail-on-new",
+                                                         help="Exit non-zero (code 3) only on findings NEW since "
+                                                              "the previous scan at least this severe (a "
+                                                              "regression ratchet). No previous scan → nothing "
+                                                              "to gate, exits 0.")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Detailed execution logs.")] = False,
     allow_private_networks: Annotated[bool, typer.Option(
         "--allow-private-networks",
@@ -191,6 +200,10 @@ def scan(
     written = [path for writer in writers for path in writer.write(directory)] + written
 
     TerminalSummary(console).print(report)
+    if report.finding_changes is not None:
+        counts = report.finding_changes.counts()
+        console.print(f"\n[bold]Since last scan[/bold] — [red]{counts['new']} new[/red], "
+                      f"{counts['persisting']} persisting, [green]{counts['resolved']} resolved[/green]")
     console.print("\n[bold]Reports[/bold]")
     for path in written:
         console.print(f"  {path}")
@@ -198,10 +211,42 @@ def scan(
     ran = [m for m in report.module_results().values() if m.status is not ModuleStatus.SKIPPED]
     if ran and all(m.status is ModuleStatus.FAILED for m in ran):
         raise typer.Exit(1)
+    _gate_on_findings(report, fail_on, fail_on_new)
 
 
-@app.command(name="scaffold-auth",
-             help="Scaffold a DRAFT active-testing authorization from a passive scan (nothing is enabled).")
+def _gate_on_findings(report: ReconReport, fail_on: Severity | None, fail_on_new: Severity | None) -> None:
+    '''
+    Exit non-zero (code 3) when findings cross a configured severity gate.
+
+    ``--fail-on`` gates on every finding at or above the threshold; ``--fail-on-new`` gates only on findings
+    new since the previous scan (a regression ratchet), so a baseline with known issues stays green until
+    the posture actually regresses.
+    Parameters:
+        report (ReconReport): The completed scan report.
+        fail_on (Severity | None): Fail on any finding at least this severe.
+        fail_on_new (Severity | None): Fail only on NEW findings at least this severe.
+    Raises:
+        typer.Exit: Code 3 when a gate is crossed.
+    '''
+    findings = report.analysis.findings
+    if fail_on is not None:
+        gating = [f for f in findings if f.severity.rank >= fail_on.rank]
+        if gating:
+            worst = max((f.severity for f in gating), key=lambda s: s.rank)
+            console.print(f"\n[red]Gate failed:[/red] {len(gating)} finding(s) at or above "
+                          f"[bold]{fail_on.value}[/bold] (worst: {worst.value}).")
+            raise typer.Exit(3)
+    if fail_on_new is not None and report.finding_changes is not None:
+        new_ids = set(report.finding_changes.new)
+        gating = [f for f in findings if f.id in new_ids and f.severity.rank >= fail_on_new.rank]
+        if gating:
+            worst = max((f.severity for f in gating), key=lambda s: s.rank)
+            console.print(f"\n[red]Regression gate failed:[/red] {len(gating)} NEW finding(s) at or above "
+                          f"[bold]{fail_on_new.value}[/bold] since the last scan (worst: {worst.value}).")
+            raise typer.Exit(3)
+
+
+@app.command(name="scaffold-auth", help="Scaffold a DRAFT active-testing authorization from a passive scan (nothing is enabled).")
 def scaffold_auth(
     domain: Annotated[str, typer.Argument(help="Target domain or URL (must be authorized).")],
     output: Annotated[Path, typer.Option("--output", "-o", help="Report directory.")] = Path("reports"),
@@ -386,13 +431,16 @@ def active_cmd(
                       f"authorization target '{auth_host}'. Refusing to run.")
         raise typer.Exit(2)
 
-    if bypass_sec and auth.auto_discover is None:
-        console.print("[red]--bypass-sec requires an auto_discover authorization[/red] (it needs the "
-                      "authorized_domains boundary). Add an auto_discover block to the authorization.")
+    if bypass_sec and not passive:
+        console.print("[red]--bypass-sec needs the passive scan[/red] to discover targets; drop --no-passive.")
         raise typer.Exit(2)
 
     orchestrator = ActiveOrchestrator(auth, now=moment)
     if dry_run:
+        if bypass_sec:
+            console.print(f"[bold red]--bypass-sec[/bold red] [dim]— a passive scan will discover targets under "
+                          f"{registrable_domain(hostname) or hostname} and run the complete check set (except "
+                          "email).[/dim]")
         _print_active_plan(orchestrator, auth, moment)
         return
     try:
@@ -404,9 +452,10 @@ def active_cmd(
     console.print(f"[bold red]ACTIVE testing[/bold red] {hostname} "
                   f"[dim](authorized; may affect the target)[/dim]")
     if bypass_sec:
-        console.print("[bold red]--bypass-sec:[/bold red] complete check set (except email) on first-party "
-                      "hosts and your embedded backends, including backend reads with the discovered public key. "
-                      "[dim]Local testing only.[/dim]")
+        console.print(f"[bold red]--bypass-sec:[/bold red] complete check set (except email) across everything "
+                      f"the passive scan discovers under [bold]{registrable_domain(hostname) or hostname}[/bold] "
+                      "and the backends the site embeds. [dim]You own the SLAs; run with sudo for full network "
+                      "probing (traceroute).[/dim]")
 
     active_dir = output / hostname / "active"
     inventory: Inventory | None = None
@@ -428,8 +477,12 @@ def active_cmd(
         # can query IP-keyed providers; it queries third parties, so no target traffic depends on this.
         net = passive_report.network.data
         orchestrator.ips = [ip.ip for ip in net.ips if ip.is_public] if net else []
-        if auth.auto_discover is not None:
-            auth, orchestrator = _apply_auto_discover(auth, passive_report, moment, orchestrator.ips,
+        # --bypass-sec derives the scope from the target itself (no auto_discover block needed); the operator
+        # authored the authorization and owns the engagement, so the target's own domain is the boundary.
+        auto = auth.auto_discover or (AutoDiscover(authorized_domains=[registrable_domain(hostname) or hostname])
+                                      if bypass_sec else None)
+        if auto is not None:
+            auth, orchestrator = _apply_auto_discover(auth, auto, passive_report, moment, orchestrator.ips,
                                                       complete=bypass_sec)
         inventory = build_inventory(passive_report)
         inv_path = write_inventory(inventory, active_dir)
@@ -484,12 +537,15 @@ def active_cmd(
             raise typer.Exit(3)
 
 
-def _apply_auto_discover(auth: AuthorizationFile, passive_report: ReconReport, moment: datetime,
-                         ips: list[str], *, complete: bool = False) -> tuple[AuthorizationFile, ActiveOrchestrator]:
+def _apply_auto_discover(auth: AuthorizationFile, auto: AutoDiscover, passive_report: ReconReport,
+                         moment: datetime, ips: list[str], *,
+                         complete: bool = False) -> tuple[AuthorizationFile, ActiveOrchestrator]:
     '''
-    Synthesize first-party targets from the passive scan and rebuild the orchestrator on the effective auth.
+    Synthesize targets from the passive scan and rebuild the orchestrator on the effective authorization.
     Parameters:
-        auth (AuthorizationFile): The committed authorization (with auto_discover).
+        auth (AuthorizationFile): The committed authorization.
+        auto (AutoDiscover): The discovery config — authored in the file, or derived from the target for
+            --bypass-sec.
         passive_report (ReconReport): The passive scan report.
         moment (datetime): Reference time for the window check.
         ips (list[str]): Resolved public IPs for the external-intelligence phase.
@@ -497,12 +553,12 @@ def _apply_auto_discover(auth: AuthorizationFile, passive_report: ReconReport, m
     Returns:
         tuple[AuthorizationFile, ActiveOrchestrator]: The effective authorization and its orchestrator.
     '''
-    assert auth.auto_discover is not None
-    synthesis = synthesize(auth.auto_discover, target=auth.target, report=passive_report, complete=complete)
+    synthesis = synthesize(auto, target=auth.target, report=passive_report, complete=complete)
     effective = apply_synthesis(auth, synthesis)
     console.print("  [green]Auto-discover[/green] "
                   f"[dim]→ {len(synthesis.function_urls)} first-party endpoint(s), "
-                  f"{len(synthesis.tls_hosts)} TLS host(s), {len(synthesis.backends)} embedded backend(s); "
+                  f"{len(synthesis.tls_hosts)} TLS host(s), {len(synthesis.backends)} embedded backend(s), "
+                  f"{len(synthesis.port_scan_targets)} port-scan host(s); "
                   f"checks: {', '.join(synthesis.checks) or '(none)'}[/dim]")
     if synthesis.third_party_hosts:
         console.print(f"  [dim]third-party hosts discovered but NOT tested: "
