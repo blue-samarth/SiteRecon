@@ -142,9 +142,10 @@ class ActiveOrchestrator:
         Run the authorized external-intelligence providers (Wayback, Shodan InternetDB) as one phase.
 
         Providers contact their own third-party hosts, not the authorization's target scope, so they use a
-        separate client; each request is still recorded in the engagement audit log (and counted toward the
-        request total) via :meth:`ActiveContext.record_external`, so the log stays complete. Provider
-        failures are isolated by the runner.
+        separate client; each request is reserved against the engagement budget via :meth:`ActiveContext.reserve`
+        before it is sent and then recorded in the audit log via :meth:`ActiveContext.log_external`, so provider
+        traffic is both bounded and logged (one reserved slot → one log row). Provider failures — including a
+        budget exhaustion raised by the reservation — are isolated by the runner.
         Parameters:
             ctx (ActiveContext): Shared context (its audit log receives the intel requests).
         Returns:
@@ -158,10 +159,13 @@ class ActiveOrchestrator:
         providers = config.providers if config and config.providers else None
 
         def audit(method: str, url: str, status: int | None) -> None:
-            ctx.record_external(EXTERNAL_INTELLIGENCE, method, url, status=status, note="external intelligence")
+            ctx.log_external(EXTERNAL_INTELLIGENCE, method, url, status=status, note="external intelligence")
+
+        async def reserve() -> None:
+            await ctx.reserve(EXTERNAL_INTELLIGENCE)   # count and bound provider traffic before each request
 
         runner = self.intel_runner or IntelRunner(timeout=self.timeout, providers=providers)
-        aggregate = await runner.run(self.auth.target, self.ips, now=started, on_request=audit)
+        aggregate = await runner.run(self.auth.target, self.ips, now=started, on_request=audit, reserve=reserve)
         requests = ctx.check_count(EXTERNAL_INTELLIGENCE) - start_count
         status = ModuleStatus.PARTIAL if aggregate.errors else ModuleStatus.SUCCESS
         for note in aggregate.notes:
@@ -169,7 +173,8 @@ class ActiveOrchestrator:
         now = datetime.now(UTC)
         return ActiveCheckResult(
             check_id=EXTERNAL_INTELLIGENCE, status=status, target=self.auth.target, description=description,
-            findings=aggregate.findings, requests_made=requests, started_at=started, finished_at=now,
+            findings=aggregate.findings, observations=aggregate.observations, requests_made=requests,
+            started_at=started, finished_at=now,
             duration_ms=round((now - started).total_seconds() * 1000, 2), errors=aggregate.errors)
 
     async def _run_one(self, check_id: str, ctx: ActiveContext) -> ActiveCheckResult:

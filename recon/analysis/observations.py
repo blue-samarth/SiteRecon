@@ -37,6 +37,8 @@ _COLLECTION_METHOD: dict[str, CollectionMethod] = {
     "cookies": CollectionMethod.HTTP_REQUEST,
     "subdomains": CollectionMethod.CT_LOG,
     "third_party": CollectionMethod.DERIVED,
+    "render": CollectionMethod.BROWSER_RENDER,
+    "vulnscan": CollectionMethod.EXTERNAL_API,
 }
 
 
@@ -126,6 +128,11 @@ class ObservationBuilder:
             self._add(r, "dns.caa_effective", d.hostname, "policy",
                       {"name": d.caa.effective_name, "records": sorted(d.caa.records), "inherited": d.caa.inherited},
                       "DNS CAA (parent climb)")
+        t = d.email.transport
+        if t.mx_hosts:   # transport-security posture only matters for a mail-receiving domain
+            self._add(r, "email.transport", d.hostname, "posture",
+                      {"mta_sts": t.mta_sts_present, "tls_rpt": t.tls_rpt_present, "bimi": t.bimi_present,
+                       "dane_mx": sorted(t.dane_mx)}, "DNS TXT/TLSA (MTA-STS, TLS-RPT, BIMI, DANE)")
 
     def _dnssec(self, r: ModuleResult) -> None:
         '''
@@ -186,6 +193,9 @@ class ObservationBuilder:
                     "fingerprint_sha256": c.fingerprint_sha256, "issuer": c.issuer_org or c.issuer,
                     "not_after": c.not_after.isoformat(), "san_count": len(c.san_dns)}, "TLS handshake")
                 self._add(r, "tls.protocol", f"{p.hostname}:{p.port}", "version", p.tls_version, "TLS handshake")
+                self._add(r, "tls.transport", f"{p.hostname}:{p.port}", "depth",
+                          {"forward_secret": p.forward_secret, "alpn": p.alpn, "chain_complete": p.chain_complete,
+                           "sct": c.sct_count}, "TLS handshake (cipher/ALPN/chain/SCT)")
 
     def _whois(self, r: ModuleResult) -> None:
         '''
@@ -277,6 +287,38 @@ class ObservationBuilder:
                 # fingerprint only (no raw value) keeps this comparable without ever storing the secret
                 self._add(r, "js.secret", self.hostname, f"{sec.type}|{sec.redacted}",
                           {"type": sec.type, "severity": sec.severity}, f"pattern match in {a.url}", Confidence.MEDIUM)
+
+    def _render(self, r: ModuleResult) -> None:
+        '''
+        Runtime endpoints, contacted hosts and client configuration a headless-browser load produced.
+
+        These carry the ``browser_render`` collection method, so runtime-only facts (endpoints that exist
+        only after JavaScript runs) stay distinguishable from statically-parsed ones.
+        Parameters:
+            r (ModuleResult): Render module result.
+        '''
+        d = r.data
+        for ref in d.endpoints:
+            self._add(r, "render.endpoint", ref.host or self.hostname, ref.value,
+                      {"method": ref.method, "same_site": ref.same_site}, "runtime request / rendered DOM")
+        for host in d.hosts_contacted:
+            self._add(r, "render.host", self.hostname, host, True, "contacted while rendering")
+        for cfg in d.client_configs:
+            self._add(r, "render.client_config", self.hostname, cfg.provider,
+                      sorted(fld.key for fld in cfg.fields), "client config in the rendered DOM")
+
+    def _vulnscan(self, r: ModuleResult) -> None:
+        '''
+        Known-vulnerable components and the advisories affecting them (external-provider provenance).
+        Parameters:
+            r (ModuleResult): Vulnerability-scan module result.
+        '''
+        for comp in r.data.vulnerable:
+            self._add(r, "vuln.component", self.hostname, f"{comp.package}@{comp.version}",
+                      {"name": comp.name, "advisories": sorted(v.id for v in comp.vulns),
+                       "cves": sorted({a for v in comp.vulns for a in v.aliases})},
+                      f"OSV lookup of {comp.package}@{comp.version}", Confidence.MEDIUM,
+                      external_provider="OSV")
 
     def _technology(self, r: ModuleResult) -> None:
         '''

@@ -208,3 +208,88 @@ def test_cli_dry_run_reports_auto_discover(tmp_path):
     assert res.exit_code == 0, res.output
     flat = " ".join(res.output.split())   # rich wraps long lines in a narrow test terminal
     assert "Auto-discover enabled" in flat and "Third-party hosts are never tested" in flat
+
+
+# ------------------------------------------------------------------ render feeds auto-discovery (--bypass-sec)
+
+def _report_static_and_render(*, static_assets, render_data):
+    from recon.models import AnalysisResult as AR
+    from recon.models import ModuleResult, ModuleStatus
+    from recon.models import ReconReport as RR
+    from recon.models import TargetInfo as TI
+    from recon.models import ToolInfo as TO
+    sk = lambda n: ModuleResult.skipped(n, "x")
+    ok = lambda n, d: ModuleResult(module=n, status=ModuleStatus.SUCCESS, started_at=T0, finished_at=T0,
+                                   duration_ms=1, data=d)
+    return RR(tool=TO(name="t", version="0", user_agent="u"),
+              target=TI(input="clusterheart.com", hostname="clusterheart.com", scope=[]), options={},
+              started_at=T0, finished_at=T0, duration_ms=1, dns=sk("dns"), network=sk("network"),
+              http=sk("http"), tls=sk("tls"), whois=sk("whois"), html=sk("html"), technology=sk("technology"),
+              subdomains=sk("subdomains"), third_party=sk("third_party"),
+              javascript=ok("javascript", static_assets), render=ok("render", render_data), analysis=AR())
+
+
+def test_render_runtime_calls_supply_backend_tables_static_missed():
+    # the SPA gap: the static bundle ships the Supabase config+host but NO literal /rest/v1/<table>, so
+    # static synthesis yields resources=[]; the render captures the runtime call and fills them in.
+    from recon.models import (
+        AssetData,
+        AssetRecord,
+        ClientConfig,
+        ClientConfigValue,
+        EndpointRef,
+        RenderData,
+    )
+    cfg = ClientConfig(provider="Supabase", kind="supabase", source_asset="https://clusterheart.com/app.js",
+                       fields=[ClientConfigValue(key="projectRef", value="ref0abcdef0123456789", sensitive=False),
+                               ClientConfigValue(key="anonKey", value=ANON, sensitive=False)])
+    static = AssetData(assets=[AssetRecord(url="https://clusterheart.com/app.js", kind="script",
+                                           client_configs=[cfg],
+                                           endpoints=[EndpointRef(value=f"https://{SUPA_HOST}", host=SUPA_HOST)])])
+    render = RenderData(final_url="https://clusterheart.com/",
+                        endpoints=[EndpointRef(value=f"https://{SUPA_HOST}/rest/v1/profiles", host=SUPA_HOST),
+                                   EndpointRef(value="https://api.clusterheart.com/o", host="api.clusterheart.com",
+                                               method="POST")])
+    report = _report_static_and_render(static_assets=static, render_data=render)
+
+    # static alone: backend has no tables
+    static_only = _report_static_and_render(static_assets=static, render_data=RenderData(final_url="x"))
+    assert synthesize(AUTO, target="clusterheart.com", report=static_only, complete=True).backends[0].resources == []
+
+    s = synthesize(AUTO, target="clusterheart.com", report=report, complete=True)
+    assert [(b.kind, b.host, b.resources) for b in s.backends] == [("supabase", SUPA_HOST, ["profiles"])]
+    assert "https://api.clusterheart.com/o" in [t.url for t in s.function_urls]   # runtime first-party endpoint
+
+
+def test_first_party_subdomains_are_folded_into_the_active_host_set():
+    # CT-discovered first-party subdomains get TLS-enumerated, port-scanned and traced like the target;
+    # wildcard, historical (gone) and third-party names are excluded.
+    from recon.models import AnalysisResult as AR
+    from recon.models import HostState, ModuleResult, ModuleStatus, SubdomainData, SubdomainRecord
+    from recon.models import ReconReport as RR
+    from recon.models import TargetInfo as TI
+    from recon.models import ToolInfo as TO
+    sk = lambda n: ModuleResult.skipped(n, "x")
+    subs = SubdomainData(query="clusterheart.com", verification_limit=100, hostnames=[
+        SubdomainRecord(hostname="api.clusterheart.com", state=HostState.REACHABLE),
+        SubdomainRecord(hostname="admin.clusterheart.com", state=HostState.RESOLVING),
+        SubdomainRecord(hostname="old.clusterheart.com", state=HostState.HISTORICAL),        # gone → excluded
+        SubdomainRecord(hostname="clusterheart.com", wildcard=True, state=HostState.RESOLVING),  # wildcard → out
+        SubdomainRecord(hostname="api.stripe.com", state=HostState.REACHABLE),               # third-party → out
+    ])
+    report = RR(tool=TO(name="t", version="0", user_agent="u"),
+                target=TI(input="clusterheart.com", hostname="clusterheart.com", scope=[]), options={},
+                started_at=T0, finished_at=T0, duration_ms=1, dns=sk("dns"), network=sk("network"),
+                http=sk("http"), tls=sk("tls"), whois=sk("whois"), html=sk("html"),
+                technology=sk("technology"), third_party=sk("third_party"),
+                subdomains=ModuleResult(module="subdomains", status=ModuleStatus.SUCCESS, started_at=T0,
+                                        finished_at=T0, duration_ms=1, data=subs), analysis=AR())
+    s = synthesize(AUTO, target="clusterheart.com", report=report, complete=True)
+    hosts = set(s.scope_hosts)
+    assert {"api.clusterheart.com", "admin.clusterheart.com"} <= hosts
+    assert "old.clusterheart.com" not in hosts and "api.stripe.com" not in hosts
+    scanned = {t.host for t in s.port_scan_targets}
+    assert {"clusterheart.com", "api.clusterheart.com", "admin.clusterheart.com"} <= scanned
+    assert scanned == {t.host for t in s.traceroute_targets}
+    assert {"api.clusterheart.com", "admin.clusterheart.com"} <= set(s.tls_hosts)
+    assert {"port_scan", "traceroute", "tls_protocol_enum"} <= set(s.checks)

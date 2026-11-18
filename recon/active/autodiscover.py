@@ -30,7 +30,7 @@ from recon.active.authorization import (
     SupabaseBackend,
     TracerouteTarget,
 )
-from recon.models import ReconReport
+from recon.models import HostState, ReconReport
 from recon.utils import registrable_domain
 
 # Checks run when auto_discover.checks is unset (standing/CI mode): safe and non-destructive.
@@ -41,6 +41,9 @@ COMPLETE_CHECKS: tuple[str, ...] = ("tls_protocol_enum", "function_url_reachabil
 # Default port profile used when complete mode synthesizes a port scan of first-party hosts.
 _AUTO_PORT_PROFILE = "common"
 _FUNCTION_URL_CAP = 25
+# Cap on CT-discovered subdomains folded into the active host set, so a domain with a large certificate
+# history does not explode the plan. The engagement budget still bounds the actual requests made.
+_SUBDOMAIN_HOST_CAP = 50
 _SUPABASE_TABLE: re.Pattern[str] = re.compile(r"/rest/v1/([A-Za-z0-9_]+)")
 
 
@@ -72,28 +75,50 @@ def _field_value(config, key: str) -> str | None:
     return next((f.value for f in config.fields if f.key == key), None)
 
 
-def _supabase_backends(assets, authorized_host_tables: dict[str, set[str]]) -> list[SupabaseBackend]:
+def _supabase_backends(configs, authorized_host_tables: dict[str, set[str]]) -> list[SupabaseBackend]:
     '''
     Build Supabase backend targets from embedded configs, using the retained anon key and discovered tables.
     Parameters:
-        assets (AssetData): The static-asset analysis.
+        configs (list[ClientConfig]): Client-config blocks found statically and/or at render time.
         authorized_host_tables (dict[str, set[str]]): Supabase host → table names discovered in endpoints.
     Returns:
         list[SupabaseBackend]: Backends with a credential and resources (skipped later if either is empty).
     '''
     out: dict[str, SupabaseBackend] = {}
-    for asset in assets.assets:
-        for config in asset.client_configs:
-            if config.kind != "supabase":
-                continue
-            ref = _field_value(config, "projectRef")
-            host = f"{ref}.supabase.co" if ref else (urlsplit(_field_value(config, "url") or "").hostname or "")
-            credential = _field_value(config, "anonKey")
-            if not host or not credential or host in out:
-                continue
-            tables = sorted(authorized_host_tables.get(host, set()))
-            out[host] = SupabaseBackend(host=host, credential=credential, resources=tables)
+    for config in configs:
+        if config.kind != "supabase":
+            continue
+        ref = _field_value(config, "projectRef")
+        host = f"{ref}.supabase.co" if ref else (urlsplit(_field_value(config, "url") or "").hostname or "")
+        credential = _field_value(config, "anonKey")
+        if not host or not credential or host in out:
+            continue
+        tables = sorted(authorized_host_tables.get(host, set()))
+        out[host] = SupabaseBackend(host=host, credential=credential, resources=tables)
     return list(out.values())
+
+
+def _first_party_subdomains(report: ReconReport | None, first_party) -> list[str]:
+    '''
+    First-party CT-discovered subdomains worth actively testing: non-wildcard, under an authorized domain,
+    and not known to be gone (HISTORICAL / non-resolving). Capped so a large cert history can't explode the plan.
+    Parameters:
+        report (ReconReport | None): The passive scan report.
+        first_party (Callable[[str | None], bool]): First-party membership test.
+    Returns:
+        list[str]: Distinct subdomain hostnames to fold into the active host set.
+    '''
+    data = report.subdomains.data if (report and report.subdomains and report.subdomains.data) else None
+    if data is None:
+        return []
+    hosts: set[str] = set()
+    for rec in data.hostnames:
+        if rec.wildcard or rec.state is HostState.HISTORICAL or rec.resolves is False:
+            continue   # skip wildcard patterns and names that do not resolve now
+        name = rec.hostname.lower().rstrip(".")
+        if first_party(name):
+            hosts.add(name)
+    return sorted(hosts)[:_SUBDOMAIN_HOST_CAP]
 
 
 def synthesize(auto: AutoDiscover, *, target: str, report: ReconReport | None,
@@ -116,30 +141,46 @@ def synthesize(auto: AutoDiscover, *, target: str, report: ReconReport | None,
             return False
         return registrable_domain(host.lower().rstrip(".")) in authorized
 
-    tls_hosts: set[str] = {target} if first_party(target) else set()
+    # The target plus every first-party CT-discovered subdomain (api., admin., staging., …): these get
+    # TLS-enumerated, port-scanned and traced just like the target, so "everything under the domain" means
+    # the whole discovered surface, not only the target and its endpoint hosts.
+    tls_hosts: set[str] = ({target} if first_party(target) else set()) | set(_first_party_subdomains(report, first_party))
     function_urls: dict[str, FunctionUrlTarget] = {}
     third_party: set[str] = set()
     supabase_tables: dict[str, set[str]] = {}
 
     assets = report.javascript.data if (report and report.javascript and report.javascript.data) else None
-    if assets is not None:
-        for ref in assets.endpoints():
-            if not (ref.host and ref.value.startswith(("http://", "https://"))):
-                continue
-            if first_party(ref.host):
-                function_urls.setdefault(ref.value, FunctionUrlTarget(url=ref.value, method="OPTIONS",
-                                                                      state_changing=False))
-            else:
-                third_party.add(ref.host)
-                if ref.host.endswith(".supabase.co"):   # a table referenced on an embedded Supabase backend
-                    table = _SUPABASE_TABLE.search(urlsplit(ref.value).path)
-                    if table:
-                        supabase_tables.setdefault(ref.host, set()).add(table.group(1))
+    render = report.render.data if (report and report.render and report.render.data) else None
+
+    # Endpoints discovered statically (bundle parsing) AND at render time (requests the running app made,
+    # plus routes in the rendered DOM). The render set is what closes the SPA gap: runtime /rest/v1/<table>
+    # calls and function URLs that only exist after JavaScript runs.
+    def _discovered_endpoints():
+        if assets is not None:
+            yield from assets.endpoints()
+        if render is not None:
+            yield from render.endpoints
+
+    for ref in _discovered_endpoints():
+        if not (ref.host and ref.value.startswith(("http://", "https://"))):
+            continue
+        if first_party(ref.host):
+            function_urls.setdefault(ref.value, FunctionUrlTarget(url=ref.value, method="OPTIONS",
+                                                                  state_changing=False))
+        else:
+            third_party.add(ref.host)
+            if ref.host.endswith(".supabase.co"):   # a table referenced on an embedded Supabase backend
+                table = _SUPABASE_TABLE.search(urlsplit(ref.value).path)
+                if table:
+                    supabase_tables.setdefault(ref.host, set()).add(table.group(1))
 
     urls = list(function_urls.values())[:_FUNCTION_URL_CAP]
     ip_trust = ([IpTrustTarget(url=f.url, method="GET") for f in urls] if complete else [])
-    backends: list[Backend] = (list(_supabase_backends(assets, supabase_tables))
-                               if complete and assets is not None else [])
+    # Client configs from both the static bundle and the rendered DOM feed the backend builder.
+    configs = [c for a in (assets.assets if assets else []) for c in a.client_configs]
+    if render is not None:
+        configs = [*configs, *render.client_configs]
+    backends: list[Backend] = list(_supabase_backends(configs, supabase_tables)) if complete else []
 
     # Complete mode also scans and traces the first-party hosts (the target plus any first-party endpoint
     # hosts) — the network checks the safe/CI set deliberately leaves out.

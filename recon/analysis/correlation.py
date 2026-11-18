@@ -9,10 +9,13 @@ such data is less certain than a live observation.
 
 from __future__ import annotations
 
-from recon.models import Confidence, Finding, Freshness, Observation
+from recon.models import Confidence, Finding, FindingState, Freshness, Observation
 
 _STALE: frozenset[Freshness] = frozenset({Freshness.STALE, Freshness.HISTORICAL})
 _LOWER: dict[Confidence, Confidence] = {Confidence.HIGH: Confidence.MEDIUM, Confidence.MEDIUM: Confidence.LOW}
+# States derived from confidence at construction, so they must be re-derived when a pass changes confidence.
+# CORROBORATED / RESOLVED / FALSE_POSITIVE come from history or review and are never overwritten here.
+_DERIVED_STATES: frozenset[FindingState] = frozenset({FindingState.SUSPECTED, FindingState.CONFIRMED})
 
 
 def correlate(findings: list[Finding]) -> list[Finding]:
@@ -56,3 +59,19 @@ def calibrate(findings: list[Finding], observations: list[Observation]) -> None:
         if refs and finding.confidence in _LOWER \
                 and all(o.external_provider and o.freshness in _STALE for o in refs):
             finding.confidence = _LOWER[finding.confidence]
+
+
+def recalc_states(findings: list[Finding]) -> None:
+    '''
+    Re-derive each finding's lifecycle state from its (possibly adjusted) confidence, in place.
+
+    ``correlate`` can raise a finding's confidence and ``calibrate`` can lower it, but neither touches the
+    ``state`` that was derived from confidence at construction — so a finding calibrated down to LOW would
+    otherwise keep its CONFIRMED state. Only confidence-derived states are re-derived; CORROBORATED,
+    RESOLVED and FALSE_POSITIVE (set from history or review) are left as they are.
+    Parameters:
+        findings (list[Finding]): Findings to re-derive states for, after correlate and calibrate.
+    '''
+    for finding in findings:
+        if finding.state in _DERIVED_STATES:
+            finding.state = FindingState.from_confidence(finding.confidence)

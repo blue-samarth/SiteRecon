@@ -27,7 +27,7 @@ def _finding(confidence, state=None):
 # ------------------------------------------------------------------ schema version
 
 def test_schema_version_bumped_to_2_2():
-    assert SCHEMA_VERSION == "2.2"
+    assert SCHEMA_VERSION == "2.3"
 
 
 # ------------------------------------------------------------------ provenance stamping

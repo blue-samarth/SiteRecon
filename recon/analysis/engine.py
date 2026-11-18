@@ -5,7 +5,8 @@ from collections import Counter
 from datetime import datetime
 from urllib.parse import urlsplit
 
-from recon.analysis.correlation import calibrate, correlate
+from recon.analysis.correlation import calibrate, correlate, recalc_states
+from recon.analysis.grading import compute_grade
 from recon.analysis.findings import FindingCollector
 from recon.analysis.tech_signatures import SIGNATURES_VERSION
 from recon.analysis.trackers import PRIVACY_SENSITIVE, TrackerCategory, classify_tracker
@@ -31,7 +32,10 @@ from recon.models import (
     HttpData,
     HttpProbe,
     InfrastructureObservation,
+    IpIntel,
     NetworkData,
+    RenderData,
+    VulnerabilityData,
     Severity,
     SpfAnalysis,
     SubdomainData,
@@ -53,6 +57,53 @@ LEGACY_TLS: set[str] = {"TLSv1", "TLSv1.1", "SSLv3", "SSLv2"}
 DOMAIN_EXPIRY_WARN_DAYS: int = 30
 HOLD_STATUSES: tuple[str, ...] = ("clienthold", "serverhold", "client hold", "server hold")
 _VERSIONED_SERVER: re.Pattern[str] = re.compile(r"[a-z][\w.-]*/\d+(?:\.\d+)+", re.I)
+# CAA issue/issuewild tag → the permitted CA's identifying domain.
+_CAA_ISSUE_RE: re.Pattern[str] = re.compile(r'\d+\s+issue(?:wild)?\s+"([^"]*)"', re.I)
+# Known CA issuer-org substrings per CAA domain, so a CT issuer like "Let's Encrypt" maps to "letsencrypt.org".
+_CA_ISSUER_HINTS: dict[str, tuple[str, ...]] = {
+    "letsencrypt.org": ("let's encrypt", "letsencrypt"), "pki.goog": ("google trust", "gts", "google"),
+    "google.com": ("google trust", "gts"), "digicert.com": ("digicert",), "sectigo.com": ("sectigo", "comodo"),
+    "globalsign.com": ("globalsign",), "amazon.com": ("amazon",), "amazontrust.com": ("amazon",),
+    "ssl.com": ("ssl.com",), "certainly.com": ("certainly",), "buypass.com": ("buypass",),
+    "zerossl.com": ("zerossl",), "entrust.net": ("entrust",), "actalis.it": ("actalis",),
+    "godaddy.com": ("go daddy", "godaddy"), "microsoft.com": ("microsoft",),
+}
+
+
+def _caa_issue_tags(records: list[str]) -> set[str]:
+    '''
+    The CA domains a CAA record set permits to issue (from issue/issuewild tags).
+    Parameters:
+        records (list[str]): Raw CAA record strings.
+    Returns:
+        set[str]: Permitted CA domains, lowercased ('issue ";"' — no CA — yields none).
+    '''
+    out: set[str] = set()
+    for rec in records:
+        for match in _CAA_ISSUE_RE.finditer(rec):
+            domain = match.group(1).strip().lower().split(";")[0].strip()
+            if domain:
+                out.add(domain)
+    return out
+
+
+def _issuer_allowed(issuer: str, allowed: set[str]) -> bool:
+    '''
+    Whether a certificate issuer org name corresponds to one of the CAA-permitted CA domains (heuristic).
+    Parameters:
+        issuer (str): Issuer organization name (e.g. from CT or the leaf cert).
+        allowed (set[str]): CAA-permitted CA domains.
+    Returns:
+        bool: True if the issuer maps to a permitted CA.
+    '''
+    low = issuer.lower()
+    for ca in allowed:
+        if any(hint in low for hint in _CA_ISSUER_HINTS.get(ca, ())):
+            return True
+        label = ca.split(".")[0]
+        if label and label in low:   # fallback for CAs without an explicit hint list
+            return True
+    return False
 
 S, C = Severity, Confidence  # enum aliases for brevity
 
@@ -110,6 +161,7 @@ class AnalysisEngine:
                 dnssec: DnssecData | None = None, resources: ResourcesData | None = None,
                 crawl: CrawlData | None = None, cookies: CookieData | None = None,
                 assets: AssetData | None = None, third_party: ThirdPartyData | None = None,
+                render: RenderData | None = None, vulnerabilities: VulnerabilityData | None = None,
                 observations: list[Observation] | None = None,
                 ) -> AnalysisResult:
         '''
@@ -136,8 +188,12 @@ class AnalysisEngine:
             AnalysisResult: A structured report containing findings, inferred infrastructure, and severity counts.
         '''
         findings: FindingCollector = FindingCollector(self.timestamp)
-        if dns: self._analyze_dns(dns, findings)
+        if dns:
+            self._analyze_dns(dns, findings)
+            self._analyze_email_transport(dns, findings)
+            self._analyze_caa_ct_mismatch(dns, subdomains, tls, findings)
         if http: self._analyze_http(http, findings)
+        if http: self._analyze_hsts_preload(http, findings)
         if http: self._analyze_waf(http, cookies, findings)
         if tls: self._analyze_tls(tls, findings)
         if whois: self._analyze_whois(whois, findings)
@@ -153,16 +209,90 @@ class AnalysisEngine:
         if assets: self._analyze_assets(assets, findings)
         if third_party: self._analyze_trackers(third_party, html, findings)
         if network: self._analyze_hosting(network, host, findings)
+        if render: self._analyze_render(render, host, findings)
+        if vulnerabilities: self._analyze_vulnerabilities(vulnerabilities, host, findings)
         if observations: findings.link(observations)
 
         infrastructure: list[InfrastructureObservation] = InfrastructureInference.infer(
             network=network, dns=dns, http=http)
         ordered: list[Finding] = correlate(findings.sorted())   # merge same-issue duplicates across modules
         calibrate(ordered, observations or [])                  # weaken findings backed only by stale external data
+        recalc_states(ordered)                                  # re-derive lifecycle state from adjusted confidence
         counts: Counter[str] = Counter(f.severity.value for f in ordered)
 
         return AnalysisResult(findings=ordered, infrastructure=infrastructure,
-                              severity_counts={s.value: counts.get(s.value, 0) for s in Severity})
+                              severity_counts={s.value: counts.get(s.value, 0) for s in Severity},
+                              grade=compute_grade(ordered))
+
+    @staticmethod
+    def _analyze_email_transport(dns: DnsData, f: FindingCollector) -> None:
+        '''
+        Report missing mail transport-security (MTA-STS, TLS-RPT, DANE) for domains that receive mail, and
+        note BIMI when present. These apply only when the domain has MX records.
+        Parameters:
+            dns (DnsData): DNS probe results (carries email.transport and MX).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        host = dns.hostname
+        t = dns.email.transport
+        if not t.mx_hosts:
+            return   # no MX → the domain does not receive mail; transport-security does not apply
+        if not t.mta_sts_present:
+            f.add("email.mta_sts_missing", host, category="email", title="No MTA-STS policy",
+                  description="The domain receives mail but publishes no MTA-STS record, so sending servers "
+                              "cannot require TLS for delivery and can be downgraded to plaintext by an "
+                              "active network attacker.",
+                  severity=S.LOW, confidence=C.HIGH, evidence=[f"no _mta-sts.{host} TXT; MX: {', '.join(t.mx_hosts[:5])}"],
+                  source="DNS TXT _mta-sts")
+        if not t.tls_rpt_present:
+            f.add("email.tls_rpt_missing", host, category="email", title="No SMTP TLS reporting (TLS-RPT)",
+                  description="No TLS-RPT record, so the domain receives no reports of TLS delivery failures "
+                              "or downgrade attempts against its mail.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"no _smtp._tls.{host} TXT"],
+                  source="DNS TXT _smtp._tls")
+        if not t.dane_mx:
+            f.add("email.dane_missing", host, category="email", title="No DANE (TLSA) on MX hosts",
+                  description="None of the MX hosts publish a TLSA record, so DANE does not protect SMTP "
+                              "delivery TLS. MTA-STS or DANE (ideally both) should back mail transport.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"no _25._tcp TLSA on: {', '.join(t.mx_hosts[:5])}"], source="DNS TLSA")
+        if t.bimi_present:
+            f.add("email.bimi_present", host, category="email", title="BIMI is published",
+                  description="A BIMI record is published (brand logo in supporting mail clients). Informational; "
+                              "BIMI requires an enforced DMARC policy to take effect.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"default._bimi.{host}: l={t.bimi_location or '—'}"], source="DNS TXT default._bimi")
+
+    @staticmethod
+    def _analyze_caa_ct_mismatch(dns: DnsData, subdomains: SubdomainData | None, tls: TlsData | None,
+                                 f: FindingCollector) -> None:
+        '''
+        Flag certificate issuers seen in CT or the live TLS cert that the current CAA policy does not permit.
+        Parameters:
+            dns (DnsData): DNS results (carries the CAA policy).
+            subdomains (SubdomainData | None): CT discovery (issuer names).
+            tls (TlsData | None): TLS results (live leaf issuer).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        allowed = _caa_issue_tags(dns.caa.records)
+        if not allowed:
+            return   # no CAA issue restriction in effect → nothing to contradict
+        seen: set[str] = set()
+        for rec in (subdomains.hostnames if subdomains else []):
+            seen.update(i for i in rec.issuers if i)
+        for probe in (tls.probes if tls else []):
+            if probe.certificate and probe.certificate.issuer_org:
+                seen.add(probe.certificate.issuer_org)
+        unauthorized = sorted({i for i in seen if not _issuer_allowed(i, allowed)})
+        if unauthorized:
+            f.add("dns.caa_ct_mismatch", dns.hostname, category="dns",
+                  title="Certificate issuer not permitted by the current CAA policy",
+                  description="Certificate Transparency (or the live certificate) shows certificates from an "
+                              "issuer the domain's current CAA policy does not list. This can be a certificate "
+                              "issued before the policy was set, or evidence of mis-issuance; review it.",
+                  severity=S.LOW, confidence=C.LOW,
+                  evidence=[f"CAA allows: {', '.join(sorted(allowed))}", f"seen issuer(s): {', '.join(unauthorized[:8])}"],
+                  source="CAA policy vs CT / TLS issuers")
 
     @staticmethod
     def _analyze_dns(dns: DnsData, f: FindingCollector) -> None:
@@ -407,6 +537,33 @@ class AnalysisEngine:
                       evidence=[f"script-src/default-src: {' '.join(script_src)}"], source=source)
 
     @staticmethod
+    def _analyze_hsts_preload(http: HttpData, f: FindingCollector) -> None:
+        '''
+        Report when HSTS is present but not eligible for the browser preload list (max-age < 1 year, or
+        missing includeSubDomains / preload). Silent when HSTS is absent — that is covered elsewhere.
+        Parameters:
+            http (HttpData): HTTP probe results (security headers).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        for probe in http.probes:
+            sh = probe.security_headers.get("strict-transport-security") if probe.security_headers else None
+            if not (probe.final_fetched and sh and sh.value):
+                continue
+            value = sh.value.lower()
+            max_age = re.search(r"max-age\s*=\s*(\d+)", value)
+            ready = (max_age is not None and int(max_age.group(1)) >= 31_536_000
+                     and "includesubdomains" in value and "preload" in value)
+            if not ready:
+                f.add("http.hsts_not_preload_ready", probe.final_url or probe.requested_url, category="http",
+                      title="HSTS not eligible for preloading",
+                      description="An HSTS header is set but does not meet the browser preload criteria "
+                                  "(max-age ≥ 1 year, includeSubDomains, and the preload directive), so the "
+                                  "domain cannot be added to the HSTS preload list.",
+                      severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[sh.value],
+                      source=f"HSTS header on {probe.final_url or probe.requested_url}")
+            return   # one representative page is enough
+
+    @staticmethod
     def _analyze_tls(tls: TlsData, f: FindingCollector) -> None:
         '''
         Analyze TLS probes: expiry, validity, hostname match, trust, protocol and key strength.
@@ -427,6 +584,25 @@ class AnalysisEngine:
             if cert is None:
                 continue
             validity = f"valid {cert.not_before:%Y-%m-%d} → {cert.not_after:%Y-%m-%d}"
+
+            if p.forward_secret is False:
+                f.add("tls.no_forward_secrecy", subject, category="tls", title="No forward secrecy",
+                      description=f"The negotiated cipher ({p.cipher}) does not provide forward secrecy, so a "
+                                  "future key compromise would expose recorded sessions. Prefer ECDHE or TLS 1.3.",
+                      severity=S.MEDIUM, confidence=C.HIGH, evidence=[f"{p.tls_version} {p.cipher}"], source=source)
+            if p.chain_complete is False:
+                f.add("tls.incomplete_chain", subject, category="tls", title="Incomplete certificate chain",
+                      description="The server sent only the leaf certificate, no intermediate(s). Clients that "
+                                  "cannot fetch or cache the intermediate will fail to build a trust path; send "
+                                  "the full chain.",
+                      severity=S.LOW, confidence=C.MEDIUM,
+                      evidence=[f"{p.chain_length} certificate(s) sent"], source=source)
+            if cert.sct_count == 0:
+                f.add("tls.no_sct", subject, category="tls", title="No embedded Certificate Transparency SCTs",
+                      description="The certificate carries no embedded SCTs, so it may not be CT-logged. Modern "
+                                  "publicly-trusted CAs embed SCTs; absence can indicate an old or privately "
+                                  "issued certificate.",
+                      severity=S.INFORMATIONAL, confidence=C.MEDIUM, evidence=["0 embedded SCTs"], source=source)
 
             if p.days_remaining is not None and p.days_remaining < 0:
                 f.add("tls.expired", subject, category="tls", title="Certificate expired",
@@ -614,6 +790,68 @@ class AnalysisEngine:
                   evidence=[f"twitter keys: {sorted(html.twitter)}"], source=source)
 
     @staticmethod
+    def _analyze_vulnerabilities(vulns: VulnerabilityData, host: str | None, f: FindingCollector) -> None:
+        '''
+        Turn OSV matches on inventoried component versions into one finding per vulnerable component.
+        Parameters:
+            vulns (VulnerabilityData): OSV lookup results.
+            host (str | None): Target hostname (subject fallback).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "informational": 0}
+        for comp in vulns.vulnerable:
+            if not comp.vulns:
+                continue
+            worst = max(comp.vulns, key=lambda v: rank.get(v.severity, 2))
+            severity = next(s for s in Severity if s.value == worst.severity) if worst.severity in rank else S.MEDIUM
+            ids = []
+            for v in comp.vulns[:10]:
+                label = ", ".join(v.aliases[:3]) or v.id
+                ids.append(f"{label}" + (f" ({v.severity})" if v.severity else "") + (f": {v.summary}" if v.summary else ""))
+            f.add("vuln.known_component", f"{comp.package}@{comp.version}", category="vuln",
+                  title=f"Known-vulnerable component: {comp.name} {comp.version}",
+                  description=(f"The detected version of {comp.name} ({comp.package} {comp.version}) is affected "
+                               f"by {len(comp.vulns)} published advisory(ies) in the OSV database. A match reflects "
+                               "the version in use, not proof the vulnerable code path is reachable; confirm and "
+                               "upgrade to a fixed release."),
+                  severity=severity, confidence=C.MEDIUM, evidence=ids,
+                  source=f"OSV ({comp.ecosystem}) lookup of {comp.package}@{comp.version}")
+
+    @staticmethod
+    def _analyze_render(render: RenderData, host: str | None, f: FindingCollector) -> None:
+        '''
+        Interpret dynamic-rendering results: third-party data egress and mixed content observed at runtime.
+        Parameters:
+            render (RenderData): Headless-browser render results.
+            host (str | None): Target hostname (finding subject).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        subject = host or (render.pages[0].url if render.pages else "render")
+        reg = registrable_domain(host) if host else None
+        third = sorted({h for h in render.hosts_contacted
+                        if h and (not reg or registrable_domain(h) != reg)})
+        if third:
+            f.add("render.third_party_egress", subject, category="render",
+                  title="Runtime requests to third-party hosts",
+                  description=("While rendering, the application sent requests to hosts outside the target's "
+                               "registrable domain. Each is a party that may receive data about the page or its "
+                               "visitors; confirm every one is intended and covered by your data-processing terms."),
+                  severity=Severity.INFORMATIONAL, confidence=Confidence.HIGH,
+                  evidence=[f"{len(third)} third-party host(s): " + ", ".join(third[:25])],
+                  source="headless-browser runtime requests")
+        https_page = any((p.url or "").startswith("https://") for p in render.pages)
+        mixed = sorted({h for r in render.requests if r.url.startswith("http://")
+                        and (h := urlsplit(r.url).hostname) and h not in ("127.0.0.1", "localhost")})
+        if https_page and mixed:
+            f.add("render.mixed_content", subject, category="render",
+                  title="Mixed content: HTTPS page made plaintext HTTP requests",
+                  description=("A page served over HTTPS triggered plaintext http:// requests at runtime. Mixed "
+                               "content can be blocked by browsers and exposes those requests to tampering."),
+                  severity=Severity.LOW, confidence=Confidence.HIGH,
+                  evidence=["http:// requests to: " + ", ".join(mixed[:15])],
+                  source="headless-browser runtime requests")
+
+    @staticmethod
     def _analyze_hosting(network: NetworkData, host: str | None, f: FindingCollector) -> None:
         '''
         Estimate where the target's resolved IPs are hosted, from ASN/RDAP allocation and (if available) an
@@ -624,7 +862,7 @@ class AnalysisEngine:
             host (str | None): Target hostname (the finding subject); falls back to the first IP.
             f (FindingCollector): Collector to which the finding will be added.
         '''
-        public: list[IpInfo] = [ip for ip in network.ips if ip.is_public]
+        public: list[IpIntel] = [ip for ip in network.ips if ip.is_public]
         if not public: return
         lines: list[str] = []
         attribution: str | None = None
@@ -761,6 +999,27 @@ class AnalysisEngine:
                   severity=S.INFORMATIONAL, confidence=C.HIGH,
                   evidence=[f"{r.hostname} → {', '.join(r.private_addresses)}" for r in private[:15]],
                   source="crt.sh + DNS A/AAAA")
+
+        for r in (x for x in data.hostnames if x.takeover_vulnerable):   # one high finding per vulnerable name
+            f.add("subdomain.takeover", r.hostname, category="subdomains",
+                  title=f"Possible subdomain takeover: {r.hostname}",
+                  description="This name delegates (CNAME) to a third-party service whose backing resource "
+                              "appears unclaimed, so anyone who registers that resource could serve content "
+                              "on this subdomain. Reclaim the resource or remove the DNS record.",
+                  severity=S.HIGH, confidence=C.MEDIUM,
+                  evidence=[r.takeover_detail or f"CNAME → {r.cname}"],
+                  source="CNAME + provider takeover fingerprint")
+
+        dangling = [r for r in data.hostnames if r.takeover_provider and not r.takeover_vulnerable]
+        if dangling:
+            f.add("subdomain.dangling_cname", data.query.lstrip("%."), category="subdomains",
+                  title="Subdomains delegate to takeover-prone providers",
+                  description="These names CNAME to services commonly associated with dangling-record "
+                              "takeovers. They appear claimed now; keep the backing resources provisioned, or "
+                              "remove the records if the services are unused.",
+                  severity=S.LOW, confidence=C.LOW,
+                  evidence=[f"{r.hostname} → {r.cname} ({r.takeover_provider})" for r in dangling[:15]],
+                  source="CNAME + provider list")
 
 
     @staticmethod

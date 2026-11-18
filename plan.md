@@ -1,3 +1,40 @@
+# siterecon — Plan & Roadmap
+
+SiteRecon is growing from a passive website-reconnaissance CLI into an external
+attack-surface intelligence platform. This file holds the overall roadmap
+(below) and the original **Phase 3** active-module design (the rest of the
+document, kept as the design-of-record for that phase).
+
+## Roadmap & current status
+
+Phases 1–5 reflect work that has shipped; the status column is reconstructed
+from the actual codebase and git history, not a separate tracker. Phase 6 is
+the next, not-yet-started frontier.
+
+| Phase | Theme | Key capabilities | Status |
+|------|-------|------------------|--------|
+| **1** | Passive recon & reporting | 14 passive modules (DNS, network, HTTP, TLS, WHOIS, HTML, tech, subdomains, third-party, JS, crawler, resources, DNSSEC, email); JSON / Markdown / HTML writers; SSRF-guarded client | ✅ shipped |
+| **2** | Observation & provenance model | `Observation`/`Finding` with provenance, freshness and lifecycle state; scan history + `ScanComparator`; schema versioning | ✅ shipped (schema **2.2**) |
+| **3** | Active-testing framework & core checks | Authorization gate (scope, window, rate/budget), `ActiveContext`, check registry; `backend_read_access` (ex-`supabase_rls`), `function_url_reachability`, `client_ip_header_trust`, `email_endpoint_rate_limit`, `tls_protocol_enum` | ✅ shipped (PR #1) |
+| **4** | External intelligence | Keyless providers (Wayback, Shodan InternetDB); hosting/geolocation inference; provider-aware freshness | ✅ shipped |
+| **5** | Active network recon, auto-discovery & regression | `port_scan`, `traceroute`; `--bypass-sec` + auto-discovery of effective authorization; cross-scan `FindingDelta` and `regression.*` findings; cross-module correlation; confidence calibration; CI gates (`--fail-on`, `--fail-on-new`) | ✅ shipped (PR #2) **← current** |
+| **6** | Dynamic rendering & deep testing | Headless-browser rendering (Playwright) to capture runtime DOM/endpoints and close the SPA gap; authenticated/session testing; business-logic probing | ⛔ not started |
+
+**Where we are:** Phase 5 is complete (merged as PR #2) — the most recent work
+is a code-review pass on top of it (regression-handler fixes, finding-state
+re-derivation, port-scan/traceroute/intel-budget hardening, ruff/mypy config).
+The Phase 6 frontier (Playwright-based dynamic rendering, authenticated and
+business-logic testing) is designed-but-deferred; see **Deferred beyond v0.3.0**
+at the end of this file. Today, JavaScript is analysed statically (parsed, never
+executed), and `CollectionMethod.BROWSER_RENDER` is a reserved provenance value
+with no collector behind it yet.
+
+> The sections below are the original Phase 3 design for the `active` command.
+> They are kept as the design-of-record; some names have since changed in the
+> shipped code (`supabase_rls` → `backend_read_access`, the registry is no longer
+> empty, network checks and `--bypass-sec` were added in Phase 5). See
+> `docs/active.md` for the current, authoritative behaviour.
+
 # siterecon v0.3.0 — Active Module Plan
 
 This release adds the `active` command, its authorization gate, data models,
@@ -273,8 +310,17 @@ tests/
 ## Deferred beyond v0.3.0
 
 Everything that needs more design before it can ship safely as an automated
-check:
+check. The first item is the core of **Phase 6**; the rest are the deeper,
+target-specific testing that phase would also open up:
 
+- **Dynamic/headless rendering (Playwright) — Phase 6.** Execute the page in a
+  real browser to capture the runtime DOM and the requests the app actually
+  makes, then feed those into the same endpoint/asset extraction the static
+  path uses. This closes the SPA/runtime-endpoint gap (e.g. a Supabase
+  `backend_read_access` probe skipped today because table names only appear
+  after JS runs). Needs: a `playwright` dependency, a render collector, the
+  `browser_render` provenance wired through, and request-budget/SSRF handling
+  for browser-initiated traffic.
 - Business-logic probing (coupon abuse, payment/order tampering,
   free-tier bypass) — needs per-application modeling, not a generic check.
 - Authenticated/session testing (login, password reset, authorization

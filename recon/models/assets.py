@@ -113,6 +113,7 @@ class AssetData(BaseModel):
     allowed_external_hosts: list[str] = Field(default_factory=list)
     service_hosts: dict[str, list[str]] = Field(default_factory=dict)   # host → assets referencing it (sample)
     endpoint_count: int = 0
+    chunks_followed: int = 0    # lazy-loaded chunks (webpack/Vite/dynamic import) fetched beyond page-referenced assets
     secret_count: int = 0
     integrity_verified: int = 0
     integrity_mismatched: int = 0

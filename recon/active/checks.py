@@ -579,7 +579,7 @@ class TlsProtocolEnumCheck(ActiveCheck):
                     outcomes[name] = "not attempted (this OpenSSL build cannot offer it)"
                     continue
                 try:
-                    await ctx.reserve_handshake(self.check_id)
+                    await ctx.reserve(self.check_id)
                 except BudgetExceeded as exc:
                     errors.append(CollectionError(module=self.check_id, target=host,
                                                   error_type="budget_exceeded", message=str(exc)))
@@ -742,47 +742,60 @@ class PortScanCheck(ActiveCheck):
         for target in ctx.auth.port_scan_targets:
             if not ctx.auth.scope.allows(target.host):
                 continue
+            # Resolve the host once and scan a single vetted address, so every port is probed against the
+            # same endpoint (resolving per-port could hit different IPs behind a round-robin / CDN).
+            vetted, public_ips = await self._resolve_public(target.host)
+            if vetted is None:
+                errors.append(CollectionError(module=self.check_id, target=target.host,
+                                              error_type="blocked_address",
+                                              message="host did not resolve to a public address"))
+                continue
+            ports = target.resolved_ports()
             open_ports: dict[int, str] = {}
-            for port in target.resolved_ports():
+            scanned = 0
+            truncated = False
+            for port in ports:
                 try:
-                    await ctx.reserve_handshake(self.check_id)
+                    await ctx.reserve(self.check_id)
                 except BudgetExceeded as exc:
                     errors.append(CollectionError(module=self.check_id, target=target.host,
                                                   error_type="budget_exceeded", message=str(exc)))
+                    truncated = True
                     break
-                state = await self._probe_port(target.host, port)
-                ctx.log_probe(self.check_id, "TCP", f"{target.host}:{port}", note=state)
+                scanned += 1
+                state = await self._connect(vetted, port)
+                ctx.log_probe(self.check_id, "TCP", f"{target.host} ({vetted}):{port}", note=state)
                 if state == "open":
                     open_ports[port] = self.WELL_KNOWN.get(port, "unknown")
-            if open_ports:
-                findings.extend(self._port_findings(target.host, open_ports))
+            if open_ports or truncated:
+                findings.extend(self._port_findings(
+                    target.host, vetted, open_ports, public_ips=public_ips,
+                    scanned=scanned, total=len(ports), truncated=truncated))
         requests = ctx.check_count(self.check_id) - start_count
         status = ModuleStatus.PARTIAL if errors else ModuleStatus.SUCCESS
         return self._result("port-scan hosts", started, status=status, findings=findings, requests=requests,
                             errors=errors)
 
-    async def _probe_port(self, host: str, port: int) -> str:
+    @staticmethod
+    async def _resolve_public(host: str) -> tuple[str | None, list[str]]:
         '''
-        Resolve a host to a public address and connect-probe one port.
+        Resolve a host and return its first publicly routable address and all of its public addresses.
 
-        Connections are made only to a publicly routable address (the same SSRF guard the passive modules
-        apply); a host that resolves only to private/loopback/metadata space is reported as 'blocked'.
+        Only publicly routable addresses are returned (the same SSRF guard the passive modules apply); a host
+        that resolves only to private/loopback/metadata space yields (None, []).
         Parameters:
-            host (str): Hostname to probe.
-            port (int): TCP port.
+            host (str): Hostname to resolve.
         Returns:
-            str: 'open', 'closed', 'filtered' or 'blocked'.
+            tuple[str | None, list[str]]: (address to scan, all public addresses) — (None, []) if blocked.
         '''
         from recon.utils import is_public_ip, system_resolve
 
         try:
-            addresses = await system_resolve(host, port)
+            addresses = await system_resolve(host, 0)
         except OSError:
-            return "filtered"
-        vetted = next((a for a in addresses if is_public_ip(a)), None)
-        if vetted is None:
-            return "blocked"
-        return await self._connect(vetted, port)
+            return None, []
+        public = [a for a in addresses if is_public_ip(a)]
+        return (public[0] if public else None), public
 
     async def _connect(self, ip: str, port: int) -> str:
         '''
@@ -806,23 +819,49 @@ class PortScanCheck(ActiveCheck):
             pass
         return "open"
 
-    def _port_findings(self, host: str, open_ports: dict[int, str]) -> list[Finding]:
+    def _port_findings(self, host: str, ip: str, open_ports: dict[int, str], *, public_ips: list[str],
+                       scanned: int, total: int, truncated: bool) -> list[Finding]:
         '''
         Build the open-ports inventory finding and, if any sensitive service is reachable, a flagged one.
+
+        Records which address was actually scanned, warns when the host fronts more than one public address
+        (so edge/CDN ports are not mistaken for the origin's), and surfaces a budget-truncated scan in the
+        finding itself rather than only in the error list.
         Parameters:
             host (str): The scanned host.
+            ip (str): The address that was scanned.
             open_ports (dict[int, str]): Open port to service name.
+            public_ips (list[str]): All public addresses the host resolved to.
+            scanned (int): Number of ports actually probed.
+            total (int): Number of ports the target listed.
+            truncated (bool): Whether the per-check budget stopped the scan before every port was probed.
         Returns:
-            list[Finding]: One or two findings.
+            list[Finding]: Zero to two findings (an incomplete-scan note if truncated with nothing open).
         '''
+        context: list[str] = [f"scanned address: {ip}"]
+        if len(public_ips) > 1:
+            context.append(f"host resolves to {len(public_ips)} public addresses ({', '.join(public_ips)}); "
+                           f"only {ip} was scanned — for CDN/proxy-fronted hosts these ports reflect the edge, "
+                           "not the origin")
+        if truncated:
+            context.append(f"scan incomplete: the request budget stopped it after {scanned} of {total} ports")
+        if not open_ports:
+            # Truncated before anything opened — still surface the incomplete scan as a finding, not just an error.
+            return [self._finding(
+                "active.port_scan_incomplete", host, title=f"Port scan of {host} did not complete",
+                description="The request budget was reached before every listed port was probed, so the absence "
+                            "of open ports here is not conclusive. Raise max_requests / max_requests_per_check "
+                            "or list fewer ports to complete the scan.",
+                severity=S.INFORMATIONAL, confidence=C.LOW, evidence=context,
+                source="TCP connect scan (operator-listed ports)")]
         listing = ", ".join(f"{p}/{svc}" for p, svc in sorted(open_ports.items()))
         out: list[Finding] = [self._finding(
             "active.open_ports", host, title=f"Open TCP ports on {host}",
             description="A bounded TCP connect scan found these ports accepting connections. Only "
                         "operator-listed ports were probed and no banners were grabbed; confirm each is "
                         "intended to be reachable from the internet.",
-            severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"open: {listing}"],
-            source="TCP connect scan (operator-listed ports)")]
+            severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[f"open: {listing}", *context],
+            source=f"TCP connect scan of {ip} (operator-listed ports)")]
         sensitive = {p: self.SENSITIVE[p] for p in open_ports if p in self.SENSITIVE}
         if sensitive:
             names = ", ".join(f"{p} ({n})" for p, n in sorted(sensitive.items()))
@@ -895,7 +934,7 @@ class TracerouteCheck(ActiveCheck):
                                               message="host did not resolve to a public address"))
                 continue
             try:
-                await ctx.reserve_handshake(self.check_id)   # one probe per traceroute operation
+                await ctx.reserve(self.check_id)   # one probe per traceroute operation
             except BudgetExceeded as exc:
                 errors.append(CollectionError(module=self.check_id, target=target.host,
                                               error_type="budget_exceeded", message=str(exc)))
@@ -965,6 +1004,10 @@ class TracerouteCheck(ActiveCheck):
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.timeout * max_hops + 10)
         except TimeoutError:
             proc.kill()
+            try:
+                await proc.wait()   # reap the killed child so it does not linger as a zombie
+            except ProcessLookupError:
+                pass
             return None
         if proc.returncode not in (0, None):
             return None

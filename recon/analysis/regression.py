@@ -9,6 +9,7 @@ from recon.models import (
     ChangeKind,
     ComparisonResult,
     Confidence,
+    DnssecStatus,
     Finding,
     FindingDelta,
     FindingState,
@@ -25,6 +26,13 @@ _TLS_RANK: dict[str, int] = {"SSLv2": 0, "SSLv3": 1, "TLSv1": 2, "TLSv1.0": 2, "
                              "TLSv1.3": 5}
 # Security headers whose removal is a meaningful regression (others are flagged at low severity).
 _IMPORTANT_HEADERS: frozenset[str] = frozenset({"strict-transport-security", "content-security-policy"})
+# DNSSEC statuses that mean the zone is signed; a move from any of these to UNSIGNED is DNSSEC being turned off.
+_DNSSEC_SIGNED: frozenset[str] = frozenset({DnssecStatus.SIGNED_VALIDATED.value,
+                                            DnssecStatus.SIGNED_UNVALIDATED.value})
+# Change kinds a drop can present as: a key that vanished (REMOVED) or whose value went to absent (MODIFIED).
+# The observation builder records absent headers/CAA with an empty value on every probe, so a dropped value
+# is usually MODIFIED, not REMOVED — matching on the kind alone misses it.
+_DROP_KINDS: tuple[ChangeKind, ...] = (ChangeKind.MODIFIED, ChangeKind.REMOVED)
 
 
 class ChangeAnalyzer:
@@ -90,7 +98,9 @@ class ChangeAnalyzer:
 
     @classmethod
     def _security_header(cls, change: Change, timestamp: datetime) -> Finding | None:
-        if change.kind is not ChangeKind.REMOVED:
+        # A header the builder records on every probe (value None when absent) drops as MODIFIED, not REMOVED;
+        # fire on present-then-absent regardless of which kind the comparator assigned.
+        if change.kind not in _DROP_KINDS or change.previous is None or change.current is not None:
             return None
         important = change.key in _IMPORTANT_HEADERS
         return cls._finding(
@@ -133,10 +143,10 @@ class ChangeAnalyzer:
 
     @classmethod
     def _dnssec(cls, change: Change, timestamp: datetime) -> Finding | None:
-        signed = {"signed", "secure"}
-        unsigned = {"unsigned", "insecure"}
-        if change.kind is not ChangeKind.MODIFIED or str(change.previous) not in signed \
-                or str(change.current) not in unsigned:
+        # Values are DnssecStatus members (signed_validated / signed_unvalidated / unsigned / …), not
+        # "signed"/"unsigned"; a signed zone going UNSIGNED is DNSSEC being turned off.
+        if change.kind is not ChangeKind.MODIFIED or str(change.previous) not in _DNSSEC_SIGNED \
+                or str(change.current) != DnssecStatus.UNSIGNED.value:
             return None
         return cls._finding(
             "regression.dnssec_disabled", change, timestamp=timestamp, title="DNSSEC no longer signed",
@@ -146,13 +156,15 @@ class ChangeAnalyzer:
 
     @classmethod
     def _caa(cls, change: Change, timestamp: datetime) -> Finding | None:
-        if change.kind is not ChangeKind.REMOVED:
+        # dns.caa_effective is recorded whenever the lookup completed (records: [] when none), so dropping a
+        # CAA policy is a MODIFIED value with emptied records, not a REMOVED key. Fire on records → empty.
+        if change.kind not in _DROP_KINDS or not _caa_records(change.previous) or _caa_records(change.current):
             return None
         return cls._finding(
             "regression.caa_removed", change, timestamp=timestamp, title="CAA policy removed",
             description="A CAA policy that was in effect in the previous scan is now absent, widening which "
                         "certificate authorities may issue for the domain.",
-            severity=S.LOW, evidence=[f"CAA policy: present → absent", f"was: {change.previous!r}"])
+            severity=S.LOW, evidence=["CAA policy: present → absent", f"was: {_caa_records(change.previous)}"])
 
     @classmethod
     def _subdomain(cls, change: Change, timestamp: datetime) -> Finding | None:
@@ -176,6 +188,18 @@ def _truthy(value: Any, key: str) -> bool:
         bool: The field's truthiness, or False if absent/not a dict.
     '''
     return bool(value.get(key)) if isinstance(value, dict) else False
+
+
+def _caa_records(value: Any) -> list[str]:
+    '''
+    Read the CAA records list out of a dns.caa_effective observation value.
+    Parameters:
+        value (Any): The observation value (expected dict with a 'records' list), or None.
+    Returns:
+        list[str]: The records, or [] when absent / not a dict.
+    '''
+    records = value.get("records") if isinstance(value, dict) else None
+    return records if isinstance(records, list) else []
 
 
 class RegressionAnalyzer:

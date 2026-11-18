@@ -10,7 +10,7 @@ observations, findings and errors for merging into the report.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -88,7 +88,8 @@ class IntelRunner:
             allow_private_networks=False, max_response_bytes=2 * 1024 * 1024, max_redirects=5)
 
     async def run(self, host: str, ips: list[str], *, now: datetime | None = None,
-                  on_request: Callable[[str, str, int | None], None] | None = None) -> IntelAggregate:
+                  on_request: Callable[[str, str, int | None], None] | None = None,
+                  reserve: Callable[[], Awaitable[None]] | None = None) -> IntelAggregate:
         '''
         Run every enabled provider and aggregate the results.
         Parameters:
@@ -97,6 +98,8 @@ class IntelRunner:
             now (datetime | None): Timestamp for observations/findings (defaults to now).
             on_request (Callable[[str, str, int | None], None] | None): Audit hook invoked per provider
                 request as (method, url, status); used to record intel traffic in the active audit log.
+            reserve (Callable[[], Awaitable[None]] | None): Budget reservation awaited before each provider
+                request; used under the active command so provider traffic is counted and bounded.
         Returns:
             IntelAggregate: Observations, findings, errors and per-provider notes.
         '''
@@ -107,7 +110,7 @@ class IntelRunner:
         timestamp = now or utcnow()
         async with client:
             ctx = IntelContext(host=host, ips=list(ips), client=client, timestamp=timestamp,
-                               on_request=on_request)
+                               on_request=on_request, reserve=reserve)
             for name in self.providers:
                 provider = REGISTRY[name]()
                 reason = provider.unavailable(ctx)

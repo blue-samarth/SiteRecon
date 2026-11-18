@@ -38,7 +38,7 @@ class HtmlReportWriter(ReportWriter):
         ("summary", "Executive Summary"), ("target", "Target"), ("findings", "Security Observations"),
         ("changes", "Changes"), ("dns", "DNS"), ("dnssec", "DNSSEC"), ("network", "Network & IP"),
         ("http", "HTTP / HTTPS"), ("tls", "TLS"), ("whois", "Registration"), ("resources", "Public Resources"),
-        ("technology", "Technologies"), ("html", "HTML"), ("crawl", "Crawl"), ("assets", "JS / CSS Assets"), ("cookies", "Cookies"),
+        ("technology", "Technologies"), ("html", "HTML"), ("crawl", "Crawl"), ("render", "Dynamic Render"), ("assets", "JS / CSS Assets"), ("vulns", "Known Vulns"), ("cookies", "Cookies"),
         ("subdomains", "Subdomains"), ("third-party", "Third Parties"), ("infrastructure", "Infrastructure"),
         ("errors", "Errors & Limitations"), ("raw", "Raw Data"), ("sources", "Sources"),
     )
@@ -72,7 +72,7 @@ class HtmlReportWriter(ReportWriter):
             "infrastructure": self._infrastructure(), "errors": self._errors(), "raw": self._raw(),
             "sources": self._sources(), "changes": self._changes(), "dnssec": self._dnssec(),
             "resources": self._resources(), "crawl": self._crawl(), "cookies": self._cookies(),
-            "assets": self._assets(),
+            "assets": self._assets(), "render": self._render(), "vulns": self._vulns(),
         }
         nav = nav_html(self.SECTIONS)
         sections = "".join(
@@ -207,8 +207,15 @@ class HtmlReportWriter(ReportWriter):
         module_line = " · ".join(f"{statuses.count(s)} {s.value}" for s in ModuleStatus if statuses.count(s))
         providers = sorted({o.provider for o in r.analysis.infrastructure})
         techs = [t.name for t in (r.technology.data.technologies if r.technology.data else [])]
+        grade = r.analysis.grade
+        grade_html = ""
+        if grade is not None:
+            grade_html = (f"<p><strong>Security grade: {escape(grade.grade)}</strong> ({grade.score}/100)</p>"
+                          + self._table(["Area", "Grade", "Score", "Findings"],
+                                        [(a.label, a.grade, a.score, a.findings) for a in grade.areas]))
         return (
-            severity_bar(counts, self.SEVERITY_ORDER)
+            grade_html
+            + severity_bar(counts, self.SEVERITY_ORDER)
             + f"<p><strong>Modules:</strong> {escape(module_line)}</p>"
             + self._table(["Module", "Status", "Duration", "Errors"],
                           [(name, self._pill(m.status.value, m.status.value), f"{m.duration_ms:.0f} ms", len(m.errors))
@@ -396,6 +403,9 @@ class HtmlReportWriter(ReportWriter):
                 f" · {self._e(p.days_remaining)} days remaining</summary>"
                 + self._kv([
                     ("Connected IP", p.ip), ("TLS version", p.tls_version), ("Cipher", p.cipher),
+                    ("Forward secrecy", p.forward_secret), ("ALPN", p.alpn),
+                    ("Chain sent", p.chain_length), ("Chain complete", p.chain_complete),
+                    ("Embedded SCTs", c.sct_count),
                     ("Chain verified", p.verified), ("Verification error", p.verification_error),
                     ("Hostname matches SAN", p.hostname_match), ("Currently valid", p.currently_valid),
                     ("Days remaining", p.days_remaining), ("Subject", c.subject), ("Issuer", c.issuer),
@@ -590,6 +600,56 @@ class HtmlReportWriter(ReportWriter):
         if d.discovered:
             out += f"<details><summary>Discovered but not fetched ({len(d.discovered)})</summary>" + self._table(
                 ["URL", "From", "Reason"], [(u.url, u.source_url, u.reason) for u in d.discovered]) + "</details>"
+        return out
+
+    def _vulns(self) -> str:
+        '''
+        Render the known-vulnerability lookup: inventoried component versions matched against OSV.
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.vulnscan):
+            return msg
+        d = self.report.vulnscan.data
+        head = (f"<p>Checked {d.components_checked} component version(s) against {escape(d.provider)}; "
+                f"{len(d.vulnerable)} had known advisories.</p>")
+        if not d.vulnerable:
+            return head
+        rows = []
+        for c in d.vulnerable:
+            sev = ", ".join(sorted({v.severity for v in c.vulns}))
+            ids = ", ".join(sorted({a for v in c.vulns for a in (v.aliases or [v.id])})[:6])
+            rows.append((f"{c.name} {c.version}", c.package, len(c.vulns), sev, ids))
+        return head + self._table(["Component", "Package", "Advisories", "Severity", "IDs"], rows)
+
+    def _render(self) -> str:
+        '''
+        Render dynamic-rendering results: pages loaded in a headless browser and the runtime surface they
+        exposed (API endpoints, hosts contacted, client config, console errors).
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.render):
+            return msg
+        d = self.report.render.data
+        out = (f"<p>Rendered {d.pages_rendered} page(s) in a headless browser; {d.request_count} runtime "
+               f"request(s).</p>"
+               + self._note("Endpoints are the API routes the running app called or referenced at runtime — "
+                            "the SPA surface static parsing misses. 'Requests' below is the full inventory."))
+        out += "<h3>Runtime API endpoints</h3>" + self._table(
+            ["Method", "Endpoint", "Host", "Same-site"],
+            [(e.method, e.value, e.host, "yes" if e.same_site else "no") for e in d.endpoints])
+        out += "<h3>Pages rendered</h3>" + self._table(
+            ["URL", "Title", "Status", "Requests", "Error"],
+            [(p.url, p.title, p.status_code, p.request_count, p.error) for p in d.pages])
+        out += "<h3>Hosts contacted at runtime</h3>" + self._table(
+            ["Host"], [(h,) for h in d.hosts_contacted])
+        if d.client_configs:
+            out += "<h3>Client configuration (rendered DOM)</h3>" + self._table(
+                ["Provider", "Fields"],
+                [(c.provider, ", ".join(f.key for f in c.fields)) for c in d.client_configs])
+        if d.console_errors:
+            out += "<h3>Console errors</h3>" + self._table(["Error"], [(e,) for e in d.console_errors[:15]])
         return out
 
     def _assets(self) -> str:

@@ -17,7 +17,7 @@ DEFAULT_USER_AGENT: str = (
 # Every selectable module, in pipeline order.
 ALL_MODULES: tuple[str, ...] = (
     "dns", "dnssec", "network", "http", "tls", "whois", "resources", "crawler", "html", "javascript",
-    "technology", "cookies", "subdomains", "third_party",
+    "technology", "cookies", "subdomains", "third_party", "render", "vulnscan",
 )
 
 # Common public DKIM selectors (providers and defaults). DKIM selectors cannot be
@@ -69,6 +69,11 @@ class Config:
     max_pages: int = 25
     crawl_delay: float = 0.25           # seconds between crawl requests (robots Crawl-delay may raise it)
     respect_robots: bool = True
+    # dynamic rendering (opt-in; executes the page's JavaScript in a headless browser)
+    render: bool = False
+    render_timeout: float = 30.0        # per-navigation / load-state timeout in seconds
+    render_max_pages: int = 10          # how many in-scope pages (origin + crawled routes) to render
+    check_vulns: bool = False           # look up detected component versions in OSV (discloses package@version)
     # frontend assets (static analysis; never executed)
     retain_client_keys: bool = False    # keep public client keys (e.g. Supabase anon key) unredacted; see --bypass-sec
     max_assets: int = 30
@@ -95,7 +100,8 @@ class Config:
         Returns:
             bool: True if the module should run.
         '''
-        flags = {"subdomains": self.subdomains, "whois": self.whois, "crawler": self.crawl}
+        flags = {"subdomains": self.subdomains, "whois": self.whois, "crawler": self.crawl,
+                 "render": self.render, "vulnscan": self.check_vulns}
         return module in self.modules and flags.get(module, True)
 
     @property

@@ -17,11 +17,20 @@ dependencies = [
     "typer>=0.28.0",
 ]
 
+[project.optional-dependencies]
+# Dynamic rendering (the `--render` flag). Needs a browser binary too: `uv run playwright install chromium`.
+render = [
+    "playwright>=1.48.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1.post1",
     "respx>=0.23.1",
+    "ruff>=0.14.0",
+    "mypy>=1.13.0",
+    "playwright>=1.48.0",
 ]
 
 [project.scripts]
@@ -39,3 +48,27 @@ packages = ["recon"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+# Keep the correctness-oriented defaults (pyflakes F-codes and the like). The codebase deliberately favours
+# compact one-line methods and small lambda helpers, so the purely stylistic one-liner/lambda rules are off.
+ignore = ["E701", "E702", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests group imports beside the section that uses them, so some module-level imports appear mid-file.
+"tests/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["recon"]
+# Third-party packages ship partial or no stubs; don't fail the run on their missing type information.
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# Annotations are being completed incrementally; untyped defs are allowed for now rather than enforced repo-wide.
+disallow_untyped_defs = false

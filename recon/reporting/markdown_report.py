@@ -56,7 +56,9 @@ class MarkdownReportWriter(ReportWriter):
             ("Technology Fingerprinting", self._technology()),
             ("HTML Analysis", self._html()),
             ("Website Crawl", self._crawl()),
+            ("Dynamic Rendering", self._render()),
             ("JavaScript and CSS Assets", self._assets()),
+            ("Known Vulnerabilities", self._vulns()),
             ("Cookies", self._cookies()),
             ("Subdomain Discovery", self._subdomains()),
             ("Third-Party Integrations", self._third_party()),
@@ -78,10 +80,17 @@ class MarkdownReportWriter(ReportWriter):
             str: Section body.
         '''
         counts = self.report.analysis.severity_counts
+        grade = self.report.analysis.grade
         lines = [
             f"Scan of **{self.report.target.hostname}** completed in {self.report.duration_ms / 1000:.1f}s "
             f"({self.report.started_at:%Y-%m-%d %H:%M:%S} UTC).",
             "",
+        ]
+        if grade is not None:
+            lines += [f"**Security grade: {grade.grade}** ({grade.score}/100)", "",
+                      self._table(["Area", "Grade", "Score", "Findings"],
+                                  [(a.label, a.grade, a.score, a.findings) for a in grade.areas]), ""]
+        lines += [
             self._table(["Module", "Status", "Duration (ms)", "Errors"],
                    [(name, res.status.value, round(res.duration_ms), len(res.errors))
                     for name, res in self.report.module_results().items()]),
@@ -243,6 +252,9 @@ class MarkdownReportWriter(ReportWriter):
             key = f"{c.public_key_algorithm} {c.public_key_size or ''} {c.public_key_curve or ''}".strip()
             out.append(self._table(["Field", "Value"], [
                 ("Connected IP", p.ip), ("TLS version", p.tls_version), ("Cipher", p.cipher),
+                ("Forward secrecy", p.forward_secret), ("ALPN", p.alpn),
+                ("Chain sent", p.chain_length), ("Chain complete", p.chain_complete),
+                ("Embedded SCTs", c.sct_count),
                 ("Chain verified", p.verified), ("Verification error", p.verification_error),
                 ("Hostname matches SAN", p.hostname_match), ("Subject", c.subject),
                 ("Issuer", c.issuer), ("Serial", c.serial_number),
@@ -591,6 +603,57 @@ class MarkdownReportWriter(ReportWriter):
             out.append("_No collection errors._\n")
         if self.report.limitations:
             out += ["**Limitations**", ""] + [f"- {lim}" for lim in self.report.limitations] + [""]
+        return "\n".join(out)
+
+    def _render(self) -> str:
+        '''
+        Dynamic-rendering results: pages loaded in a headless browser, the API routes the running app
+        called at runtime, hosts contacted, client configs and console errors.
+        Returns:
+            str: Markdown for the render section.
+        '''
+        if msg := self._unavailable(self.report.render):
+            return msg
+        d = self.report.render.data
+        out = [f"Rendered **{d.pages_rendered}** page(s) in a headless browser; the app made "
+               f"**{d.request_count}** request(s) at runtime. Endpoints below are the API routes the running "
+               "application called or referenced (the SPA surface static parsing misses).\n"]
+        out.append("**Runtime API endpoints**\n")
+        out.append(self._table(["Method", "Endpoint", "Host", "Same-site"],
+                               [(e.method or "—", e.value, e.host or "—", "yes" if e.same_site else "no")
+                                for e in d.endpoints[:60]]))
+        out.append("\n**Hosts contacted at runtime**\n")
+        out.append(", ".join(f"`{h}`" for h in d.hosts_contacted) or "_None._")
+        out.append("\n")
+        if d.client_configs:
+            out.append("\n**Client configuration found in the rendered DOM**\n")
+            out.append(self._table(["Provider", "Fields"],
+                                   [(c.provider, ", ".join(f.key for f in c.fields)) for c in d.client_configs]))
+        if d.console_errors:
+            out.append("\n**Console errors**\n")
+            out += [f"- {self._cell(e)}" for e in d.console_errors[:15]]
+            out.append("")
+        return "\n".join(out)
+
+    def _vulns(self) -> str:
+        '''
+        Known-vulnerability lookup results: inventoried component versions matched against OSV.
+        Returns:
+            str: Markdown for the known-vulnerabilities section.
+        '''
+        if msg := self._unavailable(self.report.vulnscan):
+            return msg
+        d = self.report.vulnscan.data
+        if not d.vulnerable:
+            return f"Checked {d.components_checked} component version(s) against {d.provider}; none had known advisories.\n"
+        out = [f"Checked {d.components_checked} component version(s) against {d.provider}; "
+               f"**{len(d.vulnerable)}** had known advisories.\n"]
+        rows = []
+        for c in d.vulnerable:
+            worst = ", ".join(sorted({v.severity for v in c.vulns}))
+            ids = ", ".join(sorted({a for v in c.vulns for a in (v.aliases or [v.id])})[:6])
+            rows.append((f"{c.name} {c.version}", c.package, len(c.vulns), worst, ids))
+        out.append(self._table(["Component", "Package", "Advisories", "Severity", "IDs"], rows))
         return "\n".join(out)
 
     @staticmethod

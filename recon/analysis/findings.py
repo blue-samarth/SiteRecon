@@ -109,6 +109,19 @@ RECOMMENDATIONS: dict[str, str] = {
     "js.integrity_mismatch": "Regenerate the integrity hash from the file you actually serve, or pin the asset to a versioned URL that cannot change.",
     "js.exposed_secret": "Confirm each match; if a value is a real private credential, rotate it and remove it from client-side code. Keep private keys server-side.",
     "js.client_config": "Public client keys are expected; ensure backend authorization (database/storage rules, row-level security) does not depend on them staying secret.",
+    "render.third_party_egress": "Review each third-party host and confirm it is intended and covered by your privacy / data-processing terms; remove any that are not.",
+    "render.mixed_content": "Serve every subresource over HTTPS; replace or remove the plaintext http:// requests.",
+    "subdomain.takeover": "Reclaim or re-provision the resource at the CNAME target, or remove the dangling DNS record; until then anyone can claim the subdomain.",
+    "subdomain.dangling_cname": "Keep the backing resource provisioned, or remove the record if the delegated service is no longer used.",
+    "vuln.known_component": "Upgrade the component to a release unaffected by the listed advisories; if upgrading is not possible, apply the vendor mitigation or remove the component.",
+    "email.mta_sts_missing": "Publish an MTA-STS policy in enforce mode and the _mta-sts TXT record so sending servers require TLS for delivery.",
+    "email.tls_rpt_missing": "Publish a TLS-RPT (_smtp._tls) record so you receive reports of mail TLS failures and downgrade attempts.",
+    "email.dane_missing": "Publish TLSA records for the MX hosts (with DNSSEC) to protect SMTP delivery TLS, as an alternative or complement to MTA-STS.",
+    "dns.caa_ct_mismatch": "Confirm the certificate is legitimate; if it predates the current CAA policy that is expected, otherwise investigate possible mis-issuance.",
+    "tls.no_forward_secrecy": "Disable non-forward-secret cipher suites; offer only ECDHE suites or TLS 1.3.",
+    "tls.incomplete_chain": "Configure the server to send the full certificate chain (leaf plus intermediates), not just the leaf.",
+    "tls.no_sct": "Use a publicly-trusted CA that embeds SCTs so the certificate is Certificate-Transparency logged.",
+    "http.hsts_not_preload_ready": "Set Strict-Transport-Security with max-age≥31536000, includeSubDomains and preload, then submit the domain to the HSTS preload list.",
 }
 
 LIMITATIONS: dict[str, str] = {
@@ -135,6 +148,14 @@ LIMITATIONS: dict[str, str] = {
     "hosting.": "An estimate from registry allocation and an optional offline geo database; it reflects where the address space is registered, not the physical server, and is not meaningful behind a CDN/anycast network.",
     "intel.": "Retrieved from a third-party provider; it reflects that provider's data about the IP/domain — which may be historical or stale — not a live observation by SiteRecon, and discloses the target to that provider.",
     "regression.": "A change observed between this scan and the previous one; it reflects the two compared scans, and a change is reported only when the relevant module ran successfully in both.",
+    "render.": "Observed while rendering the pages that were loaded; other pages or user-driven flows may contact different hosts or trigger different requests.",
+    "subdomain.takeover": "Heuristic from the CNAME target plus an unclaimed-resource fingerprint or a non-resolving target; confirm manually, as some providers require account-level verification before a resource can actually be claimed.",
+    "subdomain.dangling_cname": "The CNAME points at a takeover-prone provider but the resource appears claimed right now; status can change if the backing resource is later released.",
+    "vuln.known_component": "Matched by package name and version against OSV; a match means a published advisory affects that version, not that the vulnerable code path is used or reachable. Version detection is best-effort.",
+    "email.mta_sts_missing": "Detects the absence of the MTA-STS DNS record; the policy file itself (enforce vs testing mode) is not fetched.",
+    "dns.caa_ct_mismatch": "Issuer matching is heuristic and CT data can include historical certificates issued before the current CAA policy; treat as a lead, not proof.",
+    "tls.no_sct": "Only SCTs embedded in the certificate are checked; SCTs delivered via the TLS handshake or OCSP stapling are not inspected.",
+    "http.hsts_not_preload_ready": "Checks the header's preload eligibility from its directives, not actual membership in the browser preload list.",
 }
 
 _CATEGORY_MODULES: dict[str, tuple[str, ...]] = {
@@ -143,7 +164,8 @@ _CATEGORY_MODULES: dict[str, tuple[str, ...]] = {
     "cookies": ("cookies",), "resources": ("resources",), "subdomains": ("subdomains",),
     "javascript": ("javascript",), "seo": ("html",), "social": ("html",),
     "trackers": ("third_party", "javascript", "html"), "waf": ("http", "cookies"),
-    "hosting": ("network",), "intel": ("wayback", "shodan_internetdb"),
+    "hosting": ("network",), "intel": ("wayback", "shodan_internetdb"), "render": ("render",),
+    "vuln": ("vulnscan",),
 }
 
 

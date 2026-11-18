@@ -31,6 +31,7 @@ class CertificateInfo(BaseModel):
     public_key_curve: str | None = None
     fingerprint_sha256: str
     self_issued: bool
+    sct_count: int = 0          # embedded Signed Certificate Timestamps (CT proof baked into the cert)
 
 
 class TlsProbe(BaseModel):
@@ -43,6 +44,10 @@ class TlsProbe(BaseModel):
     success: bool
     tls_version: str | None = None
     cipher: str | None = None
+    forward_secret: bool | None = None    # negotiated cipher provides forward secrecy (ECDHE/DHE, or TLS 1.3)
+    alpn: str | None = None               # ALPN protocol negotiated (h2 / http/1.1)
+    chain_length: int | None = None       # certificates the server sent (leaf + intermediates)
+    chain_complete: bool | None = None    # server sent at least one intermediate (not just the leaf)
     verified: bool | None = None
     verification_error: str | None = None
     hostname_match: bool | None = None

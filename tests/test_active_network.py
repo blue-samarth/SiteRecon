@@ -63,10 +63,14 @@ def test_redaction_includes_network_targets():
 async def test_port_scan_flags_open_and_sensitive_ports(monkeypatch):
     a = auth(port_scan_targets=[PortScanTarget(host="app.test", ports=[443, 22, 9999])])
 
-    async def probe(self, host, port):
+    async def resolve(host):
+        return "203.0.113.9", ["203.0.113.9"]
+
+    async def connect(self, ip, port):
         return {443: "open", 22: "open"}.get(port, "closed")
 
-    monkeypatch.setattr(PortScanCheck, "_probe_port", probe)
+    monkeypatch.setattr(PortScanCheck, "_resolve_public", staticmethod(resolve))
+    monkeypatch.setattr(PortScanCheck, "_connect", connect)
     ctx = context(a)
     result = await PortScanCheck().run(ctx)
     assert result.requests_made == 3                              # one connect per listed port
@@ -74,6 +78,7 @@ async def test_port_scan_flags_open_and_sensitive_ports(monkeypatch):
     assert "active.open_ports" in ids and "active.sensitive_port_exposed" in ids
     openf = next(f for f in result.findings if f.id.startswith("active.open_ports"))
     assert "443/https" in openf.evidence[0] and "22/ssh" in openf.evidence[0]
+    assert any("203.0.113.9" in e for e in openf.evidence)        # records which address was scanned
     sens = next(f for f in result.findings if f.id.startswith("active.sensitive_port_exposed"))
     assert sens.severity.value == "medium" and "22 (SSH)" in sens.evidence[0]
     # audit log: one row per connection, and it matches the reported request count
@@ -81,22 +86,56 @@ async def test_port_scan_flags_open_and_sensitive_ports(monkeypatch):
     assert len(ctx.request_log) == ctx.requests_made
 
 
+async def test_port_scan_labels_multi_address_hosts(monkeypatch):
+    # a host fronting several public IPs (CDN/proxy) — the finding says which one was scanned and warns
+    a = auth(port_scan_targets=[PortScanTarget(host="app.test", ports=[443])])
+
+    async def resolve(host):
+        return "203.0.113.9", ["203.0.113.9", "203.0.113.10"]
+
+    async def connect(self, ip, port):
+        return "open"
+
+    monkeypatch.setattr(PortScanCheck, "_resolve_public", staticmethod(resolve))
+    monkeypatch.setattr(PortScanCheck, "_connect", connect)
+    result = await PortScanCheck().run(context(a))
+    openf = next(f for f in result.findings if f.id.startswith("active.open_ports"))
+    blob = " ".join(openf.evidence)
+    assert "203.0.113.9" in blob and "2 public addresses" in blob and "edge" in blob
+
+
 async def test_port_scan_no_open_ports_no_finding(monkeypatch):
     a = auth(port_scan_targets=[PortScanTarget(host="app.test", ports=[80, 443])])
 
-    async def probe(self, host, port):
+    async def resolve(host):
+        return "203.0.113.9", ["203.0.113.9"]
+
+    async def connect(self, ip, port):
         return "filtered"
 
-    monkeypatch.setattr(PortScanCheck, "_probe_port", probe)
+    monkeypatch.setattr(PortScanCheck, "_resolve_public", staticmethod(resolve))
+    monkeypatch.setattr(PortScanCheck, "_connect", connect)
     result = await PortScanCheck().run(context(a))
     assert result.findings == [] and result.requests_made == 2
 
 
-async def test_port_scan_budget_stops_the_scan():
+async def test_port_scan_budget_stops_the_scan_and_surfaces_it(monkeypatch):
     a = auth(max_requests=2, port_scan_targets=[PortScanTarget(host="app.test", ports=[80, 443, 22, 8080])])
-    result = await PortScanCheck().run(context(a))   # real _probe_port, but budget cuts it off at 2
+
+    async def resolve(host):
+        return "203.0.113.9", ["203.0.113.9"]
+
+    async def connect(self, ip, port):
+        return "closed"
+
+    monkeypatch.setattr(PortScanCheck, "_resolve_public", staticmethod(resolve))
+    monkeypatch.setattr(PortScanCheck, "_connect", connect)
+    result = await PortScanCheck().run(context(a))   # budget cuts it off at 2 of 4 ports
     assert result.requests_made == 2 and result.status.value == "partial"
     assert any(e.error_type == "budget_exceeded" for e in result.errors)
+    # the truncation is surfaced in a finding, not only in the error list
+    inc = next(f for f in result.findings if f.id.startswith("active.port_scan_incomplete"))
+    assert "incomplete" in " ".join(inc.evidence).lower()
 
 
 async def test_connect_classifies_open_and_closed():
@@ -110,13 +149,10 @@ async def test_connect_classifies_open_and_closed():
         srv.close()
 
 
-async def test_probe_port_blocks_non_public_address():
-    srv = socket.create_server(("127.0.0.1", 0))
-    port = srv.getsockname()[1]
-    try:
-        assert await PortScanCheck(timeout=1.0)._probe_port("127.0.0.1", port) == "blocked"
-    finally:
-        srv.close()
+async def test_resolve_public_rejects_non_public_address():
+    # a host resolving only to loopback/private space yields no scannable address (SSRF guard)
+    vetted, public = await PortScanCheck(timeout=1.0)._resolve_public("127.0.0.1")
+    assert vetted is None and public == []
 
 
 def test_port_scan_prerequisites():
