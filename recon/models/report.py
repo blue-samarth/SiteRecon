@@ -19,7 +19,9 @@ from recon.models.html import HtmlData
 from recon.models.http import HttpData
 from recon.models.network import NetworkData
 from recon.models.observations import ComparisonResult, Observation
+from recon.models.render import RenderData
 from recon.models.resources import ResourcesData
+from recon.models.vulns import VulnerabilityData
 from recon.models.subdomains import SubdomainData
 from recon.models.technology import TechnologyData
 from recon.models.third_party import ThirdPartyData
@@ -29,7 +31,7 @@ from recon.models.whois import DomainRegistration
 # 2.1 adds optional provenance/freshness fields to observations and a lifecycle `state` to findings.
 # 2.2 adds the optional `finding_changes` delta (new/persisting/resolved) since the previous scan. All are
 # additive with safe defaults, so reports written by older versions still load.
-SCHEMA_VERSION: str = "2.2"
+SCHEMA_VERSION: str = "2.3"
 
 
 class Finding(BaseModel):
@@ -83,6 +85,29 @@ class InfrastructureObservation(BaseModel):
     note: str | None = None
 
 
+class AreaGrade(BaseModel):
+    '''
+    The grade for one posture area.
+    '''
+    area: str                   # machine key: tls / headers / dns_email / exposure
+    label: str                  # human label
+    score: int                  # 0–100
+    grade: str                  # A+ … F
+    findings: int = 0           # grade-affecting findings in this area
+    penalty: int = 0            # total points deducted
+
+
+class SecurityGrade(BaseModel):
+    '''
+    An Observatory-style overall security grade with a per-area breakdown.
+    '''
+    score: int                  # 0–100 overall
+    grade: str                  # A+ … F
+    areas: list[AreaGrade] = Field(default_factory=list)
+    note: str = ("A relative, comparable score (100 minus severity-weighted deductions per area, averaged). "
+                 "It summarizes posture for trend tracking; it is not a pass/fail audit.")
+
+
 class AnalysisResult(BaseModel):
     '''
     Output of the analysis engine.
@@ -90,6 +115,7 @@ class AnalysisResult(BaseModel):
     findings: list[Finding] = Field(default_factory=list)
     infrastructure: list[InfrastructureObservation] = Field(default_factory=list)
     severity_counts: dict[str, int] = Field(default_factory=dict)
+    grade: SecurityGrade | None = None
 
 
 class FindingDelta(BaseModel):
@@ -171,6 +197,8 @@ class ReconReport(BaseModel):
     crawler: ModuleResult[CrawlData] = Field(default_factory=_skipped("crawler"))
     cookies: ModuleResult[CookieData] = Field(default_factory=_skipped("cookies"))
     javascript: ModuleResult[AssetData] = Field(default_factory=_skipped("javascript"))
+    render: ModuleResult[RenderData] = Field(default_factory=_skipped("render"))
+    vulnscan: ModuleResult[VulnerabilityData] = Field(default_factory=_skipped("vulnscan"))
     observations: list[Observation] = Field(default_factory=list)
     analysis: AnalysisResult
     comparison: ComparisonResult | None = None    # observation-level changes since the previous stored scan
@@ -188,5 +216,6 @@ class ReconReport(BaseModel):
             "dns": self.dns, "dnssec": self.dnssec, "network": self.network, "http": self.http,
             "tls": self.tls, "whois": self.whois, "resources": self.resources, "crawler": self.crawler,
             "html": self.html, "javascript": self.javascript, "technology": self.technology, "cookies": self.cookies,
-            "subdomains": self.subdomains, "third_party": self.third_party,
+            "subdomains": self.subdomains, "third_party": self.third_party, "render": self.render,
+            "vulnscan": self.vulnscan,
         }

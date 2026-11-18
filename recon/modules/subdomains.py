@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 import httpx
 
+from recon.analysis.takeover import match_cname
 from recon.models import CollectionError, DnsQueryStatus, SubdomainData, SubdomainRecord, TlsProbe
 from recon.models.subdomains import CtEntry, HostState, ProviderResult
 from recon.modules.base import Collector
@@ -414,17 +415,55 @@ class SubdomainCollector(Collector[SubdomainData]):
         ordered = sorted(by_host.values(), key=lambda r: (r.hostname.count("."), r.hostname))
         return ordered, len(dropped)
 
+    async def _assess_takeover(self, rec: SubdomainRecord) -> None:
+        '''
+        Assess subdomain-takeover risk from the record's CNAME: match a takeover-prone provider, then confirm
+        via a non-resolving target (dangling) or the provider's unclaimed-resource fingerprint in the response.
+        Parameters:
+            rec (SubdomainRecord): Record to update in place (sets takeover_* fields).
+        '''
+        if not rec.cname:
+            return
+        sig = match_cname(rec.cname)
+        if sig is None:
+            return
+        rec.takeover_provider = sig.provider
+        if rec.resolves is False:
+            if sig.nxdomain_vulnerable:
+                rec.takeover_vulnerable = True
+                rec.takeover_detail = f"CNAME → {rec.cname}; {sig.provider} target does not resolve (dangling)"
+            else:
+                rec.takeover_detail = f"CNAME → {rec.cname} ({sig.provider}); target does not resolve"
+            return
+        if rec.resolves and self.http_client is not None and sig.fingerprints and not rec.private_addresses:
+            try:
+                resp = await self.http_client.get(f"https://{rec.hostname}/")
+                if sig.body_unclaimed(resp.body.decode("utf-8", "replace")[:20000]):
+                    rec.takeover_vulnerable = True
+                    rec.takeover_detail = (f"CNAME → {rec.cname} ({sig.provider}); unclaimed-resource "
+                                           "fingerprint in the response")
+                else:
+                    rec.takeover_detail = f"CNAME → {rec.cname} ({sig.provider}); appears claimed"
+            except BlockedRequestError as exc:
+                rec.takeover_detail = f"CNAME → {rec.cname} ({sig.provider}); blocked: {exc.reason}"
+            except (httpx.HTTPError, OSError) as exc:
+                rec.takeover_detail = f"CNAME → {rec.cname} ({sig.provider}); fetch failed: {type(exc).__name__}"
+        else:
+            rec.takeover_detail = f"CNAME → {rec.cname} ({sig.provider})"
+
     async def _verify(self, rec: SubdomainRecord) -> None:
         '''
         Resolve a hostname and optionally check HTTPS and TLS; private addresses are never contacted.
         Parameters:
             rec (SubdomainRecord): Record to update in place.
         '''
-        a, aaaa = await asyncio.gather(self.dns_client.query(rec.hostname, "A"),
-                                       self.dns_client.query(rec.hostname, "AAAA"))
+        a, aaaa, cname = await asyncio.gather(self.dns_client.query(rec.hostname, "A"),
+                                              self.dns_client.query(rec.hostname, "AAAA"),
+                                              self.dns_client.query(rec.hostname, "CNAME"))
         rec.verified = True
         rec.addresses = list(dict.fromkeys(a.values + aaaa.values))
         rec.private_addresses = [ip for ip in rec.addresses if not is_public_ip(ip)]
+        rec.cname = cname.values[0].rstrip(".") if cname.values else None
         statuses = {a.status, aaaa.status}
         if rec.addresses:
             rec.resolves, rec.dns_status, rec.state = True, DnsQueryStatus.NOERROR.value, HostState.RESOLVING
@@ -434,6 +473,8 @@ class SubdomainCollector(Collector[SubdomainData]):
             rec.resolves, rec.dns_status, rec.state = False, DnsQueryStatus.NODATA.value, HostState.HISTORICAL
         else:
             rec.resolves, rec.dns_status = None, a.status.value  # inconclusive: stays UNVERIFIED
+
+        await self._assess_takeover(rec)   # before the early-return: a dangling CNAME often does not resolve
 
         if not rec.resolves or rec.private_addresses:
             return

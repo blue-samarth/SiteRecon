@@ -586,6 +586,51 @@ class SecretScanner:
         return keys[-1] if keys else None
 
 
+class ChunkExtractor:
+    '''
+    Finds lazy-loaded JS chunks a bundle references so they can be fetched and analyzed too.
+
+    SPAs split code into chunks loaded on demand (webpack, Vite) or via dynamic ``import()``; secrets and
+    endpoints often live only in those chunks, which are not referenced in the HTML. This recovers the ones
+    whose paths appear as literals: Vite ``assets/*.js`` (incl. ``__vite__mapDeps`` arrays), webpack hashed
+    ``.chunk.js`` / ``static/js`` paths, and literal ``import("…js")`` targets. Webpack URLs assembled at
+    runtime from a chunk-id→hash map are not literals and are not recovered.
+    '''
+
+    MAX: ClassVar[int] = 80
+    _VITE: ClassVar[re.Pattern[str]] = re.compile(r"""["'`]((?:[\w./@-]*/)?assets/[\w./@-]+\.m?js)["'`]""")
+    _WEBPACK: ClassVar[re.Pattern[str]] = re.compile(
+        r"""["'`]((?:\.{0,2}/|static/)[\w./-]*?[-.][0-9a-f]{6,}(?:\.chunk)?\.m?js)["'`]""", re.I)
+    _IMPORT: ClassVar[re.Pattern[str]] = re.compile(r"""import\(\s*["'`]([^"'`]+?\.m?js)["'`]""", re.I)
+
+    @classmethod
+    def extract(cls, text: str, base_url: str) -> list[str]:
+        '''
+        Return absolute URLs of lazy chunks referenced in a bundle (resolved against the bundle's own URL).
+        Parameters:
+            text (str): Bundle text.
+            base_url (str): The bundle's URL, for resolving relative chunk paths.
+        Returns:
+            list[str]: Absolute chunk URLs (capped, deduplicated, order preserved).
+        '''
+        if not ("__vite__mapDeps" in text or "webpackChunk" in text or "__webpack_require__" in text
+                or "import(" in text):
+            return []
+        paths: list[str] = []
+        for rx in (cls._VITE, cls._WEBPACK, cls._IMPORT):
+            paths.extend(m.group(1) for m in rx.finditer(text))
+        parts = urlsplit(base_url)
+        root = f"{parts.scheme}://{parts.netloc}/"   # bundler paths like "assets/…" are root-relative, not dir-relative
+        out: dict[str, None] = {}
+        for path in paths:
+            base = base_url if path.startswith(("http://", "https://", "//", "./", "../")) else root
+            try:
+                out.setdefault(urljoin(base, path), None)
+            except ValueError:
+                continue
+        return list(out)[: cls.MAX]
+
+
 class AssetCollector(Collector[AssetData]):
     '''
     Downloads in-scope (and explicitly allowed) JS/CSS assets and analyzes them statically.
@@ -634,6 +679,7 @@ class AssetCollector(Collector[AssetData]):
         self.retain_client_keys = retain_client_keys
         self._sem = asyncio.Semaphore(max(1, concurrency))
         self._bytes = 0
+        self._chunk_urls: list[str] = []   # lazy chunks discovered inside processed bundles
 
     def references(self) -> list[AssetRef]:
         '''
@@ -678,16 +724,30 @@ class AssetCollector(Collector[AssetData]):
 
         records = await asyncio.gather(*(self._process(ref) for ref in selected))
         for rec in records:
-            if rec.error == "byte_limit":
-                data.skipped.append(SkippedAsset(url=rec.url, source_page=rec.source_page, reason="byte_limit"))
+            self._absorb(data, rec, errors)
+
+        # second pass: lazy-loaded chunks referenced inside the bundles (webpack / Vite / dynamic import),
+        # which are not linked from the HTML — secrets and endpoints often live only here.
+        seen = {ref.url for ref in selected}
+        chunk_refs: list[AssetRef] = []
+        remaining = self.max_assets - len(selected)
+        for curl in dict.fromkeys(self._chunk_urls):
+            if remaining <= 0:
+                break
+            if curl in seen:
                 continue
-            data.assets.append(rec)
-            if rec.error:
-                errors.append(self.error(rec.url, "asset_fetch_failed", rec.error))
-            for host in rec.service_hosts:
-                sample = data.service_hosts.setdefault(host, [])
-                if len(sample) < 3:
-                    sample.append(rec.url)
+            host = urlsplit(curl).hostname
+            if not (self.scope.allows(host) or self.allowed.allows(host)):
+                continue
+            seen.add(curl)
+            chunk_refs.append(AssetRef(curl, "script", "(lazy chunk)", None))
+            remaining -= 1
+        if chunk_refs:
+            chunk_records = await asyncio.gather(*(self._process(ref) for ref in chunk_refs))
+            data.chunks_followed = sum(1 for r in chunk_records if not r.error)
+            for rec in chunk_records:
+                self._absorb(data, rec, errors)
+
         data.total_bytes = self._bytes
         data.service_hosts = dict(sorted(data.service_hosts.items()))
         data.endpoint_count = len(data.endpoints())
@@ -695,6 +755,25 @@ class AssetCollector(Collector[AssetData]):
         data.integrity_verified = sum(1 for a in data.assets if a.integrity_status == "verified")
         data.integrity_mismatched = sum(1 for a in data.assets if a.integrity_status == "mismatch")
         return data, errors
+
+    def _absorb(self, data: AssetData, rec: AssetRecord, errors: list[CollectionError]) -> None:
+        '''
+        Fold one processed asset record into the aggregate result (shared by the initial and chunk passes).
+        Parameters:
+            data (AssetData): Aggregate result, updated in place.
+            rec (AssetRecord): The processed asset.
+            errors (list[CollectionError]): Error accumulator.
+        '''
+        if rec.error == "byte_limit":
+            data.skipped.append(SkippedAsset(url=rec.url, source_page=rec.source_page, reason="byte_limit"))
+            return
+        data.assets.append(rec)
+        if rec.error:
+            errors.append(self.error(rec.url, "asset_fetch_failed", rec.error))
+        for host in rec.service_hosts:
+            sample = data.service_hosts.setdefault(host, [])
+            if len(sample) < 3:
+                sample.append(rec.url)
 
     async def _process(self, ref: AssetRef) -> AssetRecord:
         '''
@@ -730,6 +809,8 @@ class AssetCollector(Collector[AssetData]):
         rec.endpoints = EndpointExtractor.extract(text, own_host, self.scope)
         rec.client_configs = ClientConfigExtractor.extract(text, rec.url, retain=self.retain_client_keys)
         rec.secrets = SecretScanner.scan(text, rec.url)
+        if kind == "script":
+            self._chunk_urls.extend(ChunkExtractor.extract(text, resp.url))
         map_ref = BundleAnalyzer.source_map(text, resp.header("sourcemap") or resp.header("x-sourcemap"))
         if map_ref:
             resolved = map_ref if map_ref.startswith("data:") else urljoin(resp.url, map_ref)

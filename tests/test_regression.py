@@ -123,7 +123,7 @@ def test_change_findings_name_security_regressions():
         Change(kind=ChangeKind.MODIFIED, type="cookie", target="x", key="sid", module="cookies",
                previous={"secure": True, "http_only": True}, current={"secure": False, "http_only": True}),
         Change(kind=ChangeKind.MODIFIED, type="dnssec.status", target="x", key="status", module="dnssec",
-               previous="signed", current="unsigned"),
+               previous="signed_validated", current="unsigned"),
         Change(kind=ChangeKind.ADDED, type="subdomain", target="x", key="new.x", module="subdomains"),
     )
     codes = _codes(cmp)
@@ -166,3 +166,106 @@ def test_change_findings_are_merged_and_classified_new(tmp_path):
     ids = [f.id.split(":", 1)[0] for f in curr.analysis.findings]
     assert "regression.security_header_removed" in ids
     assert any(fid.startswith("regression.security_header_removed") for fid in curr.finding_changes.new)
+
+
+# ------------------------------------------------------------------ real pipeline: ObservationBuilder + ScanComparator
+# These go through the actual observation builder and comparator (not hand-built Change objects), so they
+# catch the real-scan encoding the synthetic tests miss: absent headers / emptied CAA are recorded on every
+# probe, so a drop is a MODIFIED value (not a REMOVED key), and DNSSEC values are DnssecStatus members.
+
+from recon.analysis import ObservationBuilder
+from recon.models import (
+    CaaAnalysis,
+    DmarcAnalysis,
+    DnsData,
+    DnsQueryStatus,
+    DnssecData,
+    DnssecStatus,
+    EmailSecurity,
+    HttpData,
+    HttpProbe,
+    SecurityHeader,
+    SpfAnalysis,
+)
+
+_MODS = ("dns", "network", "http", "tls", "whois", "html", "technology", "subdomains", "third_party")
+
+
+def _mr(name, data):
+    return ModuleResult(module=name, status=ModuleStatus.SUCCESS, started_at=T0, finished_at=T0,
+                        duration_ms=1, data=data)
+
+
+def _report_mods(scan_id, **mods):
+    sk = lambda n: ModuleResult.skipped(n, "x")
+    base = {n: sk(n) for n in _MODS}
+    base.update(mods)
+    rep = ReconReport(
+        scan_id=scan_id, tool=ToolInfo(name="t", version="0", user_agent="u"),
+        target=TargetInfo(input="x", hostname="x", scope=[]), options={}, started_at=T0, finished_at=T0,
+        duration_ms=1, analysis=AnalysisResult(), **base)
+    rep.observations = ObservationBuilder("x", rep.module_results()).build()
+    return rep
+
+
+def _http(hsts_value):
+    sh = SecurityHeader(name="strict-transport-security", present=hsts_value is not None, value=hsts_value)
+    probe = HttpProbe(requested_url="https://x/", success=True, final_fetched=True, final_url="https://x/",
+                      status_code=200, redirects_to_https=True, server="s",
+                      security_headers={"strict-transport-security": sh})
+    return _mr("http", HttpData(probes=[probe]))
+
+
+def _dns(caa_records):
+    caa = CaaAnalysis(effective_name="x", records=list(caa_records), inherited=False, complete=True)
+    email = EmailSecurity(spf=SpfAnalysis(lookup_status=DnsQueryStatus.NODATA),
+                          dmarc=DmarcAnalysis(name="_dmarc.x", lookup_status=DnsQueryStatus.NXDOMAIN),
+                          dkim_selectors_checked=["default"])
+    return _mr("dns", DnsData(hostname="x", queries={}, email=email, caa=caa))
+
+
+def _dnssec(status):
+    return _mr("dnssec", DnssecData(zone="x", status=status, ds_status="x", dnskey_status="x"))
+
+
+def _finding_codes_and_kinds(prev, curr):
+    comparison = ScanComparator.compare(prev, curr)
+    kinds = {(c.type, c.key): c.kind for c in comparison.changes}
+    codes = {f.id.split(":", 1)[0] for f in ChangeAnalyzer.analyze(comparison, T0)}
+    return codes, kinds
+
+
+def test_security_header_drop_is_detected_as_modified_in_a_real_scan():
+    # the header is recorded on every probe (value None when absent), so dropping it is MODIFIED, not REMOVED
+    prev = _report_mods("s1", http=_http("max-age=31536000"))
+    curr = _report_mods("s2", http=_http(None))
+    codes, kinds = _finding_codes_and_kinds(prev, curr)
+    assert kinds[("http.security_header", "strict-transport-security")] is ChangeKind.MODIFIED
+    assert "regression.security_header_removed" in codes
+
+
+def test_caa_drop_is_detected_when_records_empty_in_a_real_scan():
+    # dns.caa_effective is recorded whenever the lookup completed, so dropping CAA empties records (MODIFIED)
+    prev = _report_mods("s1", dns=_dns(['0 issue "letsencrypt.org"']))
+    curr = _report_mods("s2", dns=_dns([]))
+    codes, kinds = _finding_codes_and_kinds(prev, curr)
+    assert kinds[("dns.caa_effective", "policy")] is ChangeKind.MODIFIED
+    assert "regression.caa_removed" in codes
+
+
+def test_dnssec_disabled_is_detected_from_enum_values_in_a_real_scan():
+    prev = _report_mods("s1", dnssec=_dnssec(DnssecStatus.SIGNED_VALIDATED))
+    curr = _report_mods("s2", dnssec=_dnssec(DnssecStatus.UNSIGNED))
+    codes, kinds = _finding_codes_and_kinds(prev, curr)
+    assert kinds[("dnssec.status", "status")] is ChangeKind.MODIFIED
+    assert "regression.dnssec_disabled" in codes
+
+
+def test_no_regression_when_posture_is_unchanged_in_a_real_scan():
+    # the same present header / signed zone / CAA in both scans produces no change findings
+    prev = _report_mods("s1", http=_http("max-age=1"), dnssec=_dnssec(DnssecStatus.SIGNED_VALIDATED),
+                        dns=_dns(['0 issue "letsencrypt.org"']))
+    curr = _report_mods("s2", http=_http("max-age=1"), dnssec=_dnssec(DnssecStatus.SIGNED_VALIDATED),
+                        dns=_dns(['0 issue "letsencrypt.org"']))
+    codes, _ = _finding_codes_and_kinds(prev, curr)
+    assert codes == set()

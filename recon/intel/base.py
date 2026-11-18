@@ -15,7 +15,7 @@ retrieved facts stay clearly distinguishable from directly-collected ones.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar
@@ -47,15 +47,23 @@ class IntelContext:
     # Optional audit hook, invoked (method, url, status) for every provider request; set when running
     # under the active command so third-party intelligence traffic appears in the engagement audit log.
     on_request: Callable[[str, str, int | None], None] | None = None
+    # Optional budget reservation, awaited *before* each request; set under the active command so provider
+    # traffic is counted and bounded by the engagement budget. It raises to stop a provider when exhausted.
+    reserve: Callable[[], Awaitable[None]] | None = None
 
     async def fetch(self, url: str) -> FetchOutcome:
         '''
-        GET a provider URL through the shared client, notifying the audit hook with the outcome.
+        GET a provider URL through the shared client, reserving budget first and auditing the outcome.
+
+        The budget slot is taken before the request is sent, so the engagement budget actually bounds
+        provider traffic; if it is exhausted the reservation raises and the provider stops.
         Parameters:
             url (str): The URL to fetch.
         Returns:
             FetchOutcome: The fetch result (never raises for request failures).
         '''
+        if self.reserve is not None:
+            await self.reserve()
         outcome = await self.client.fetch(url)
         if self.on_request is not None:
             self.on_request("GET", url, outcome.final.status_code if outcome.final else None)

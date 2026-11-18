@@ -110,6 +110,9 @@ def scan(
     crawl_delay: Annotated[float, typer.Option(min=0, max=10, help="Delay between crawl requests (s).")] = 0.25,
     ignore_robots: Annotated[bool, typer.Option(
         "--ignore-robots", help="Crawl paths disallowed by robots.txt (only with explicit authorization).")] = False,
+    render: Annotated[bool, typer.Option("--render", help="Load the page in a headless browser (Playwright) and capture runtime requests/endpoints.")] = False,
+    render_timeout: Annotated[float, typer.Option(min=1, max=120, help="Render navigation/idle timeout (s).")] = 30.0,
+    check_vulns: Annotated[bool, typer.Option("--check-vulns", help="Look up detected component versions in OSV (discloses package@version to osv.dev).")] = False,
     max_assets: Annotated[int, typer.Option(min=0, max=200, help="Maximum JS/CSS assets to download and analyze.")] = 30,
     asset_host: Annotated[list[str] | None, typer.Option(
         "--asset-host", help="External host allowed for asset downloads (repeatable; e.g. a CDN you operate).")] = None,
@@ -178,6 +181,7 @@ def scan(
         max_subdomains=max_subdomains, whois=whois, modules=selected, crawl=crawl, crawl_depth=depth,
         max_pages=max_pages, crawl_delay=crawl_delay, respect_robots=not ignore_robots, history=history,
         max_assets=max_assets, asset_hosts=asset_hosts, geoip_db=geoip_db,
+        render=render, render_timeout=render_timeout, check_vulns=check_vulns,
     )
     console.print(f"[bold]Scanning[/bold] {hostname} [dim](passive; authorized targets only)[/dim]")
     with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
@@ -462,7 +466,10 @@ def active_cmd(
     if passive:
         console.print("\n[bold]Step 1 — passive recon[/bold] [dim](building inventory)[/dim]")
         pconfig = Config(target_input=domain, hostname=hostname, output_dir=output, output_format=output_format,
-                         crawl=True, history=False, verbose=verbose, retain_client_keys=bypass_sec)
+                         crawl=True, history=False, verbose=verbose, retain_client_keys=bypass_sec,
+                         render=bypass_sec, probe_subdomains=bypass_sec, check_vulns=bypass_sec,
+                         crawl_depth=10 if bypass_sec else 1,       # --bypass-sec crawls deep…
+                         max_pages=100 if bypass_sec else 25)       # …and wide, so the deep crawl has pages to find
         with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
             passive_report = asyncio.run(ScanOrchestrator(pconfig).run(progress=advance))
         p_writers: list[ReportWriter] = [JsonReportWriter(passive_report)]

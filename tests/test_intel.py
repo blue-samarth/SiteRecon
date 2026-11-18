@@ -5,7 +5,7 @@ import httpx
 import respx
 
 from recon.intel import IntelRunner, REGISTRY
-from recon.intel.base import IntelContext, IntelResult, IntelligenceProvider
+from recon.intel.base import IntelligenceProvider
 from recon.models import CollectionMethod, Confidence, Freshness
 from recon.utils.http_client import SafeHttpClient
 from recon.utils.scope import Scope

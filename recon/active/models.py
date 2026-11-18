@@ -4,9 +4,9 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
-from recon.models import CollectionError, Finding, ModuleStatus, TargetInfo
+from recon.models import CollectionError, Finding, ModuleStatus, Observation, TargetInfo
 
-SCHEMA_VERSION: str = "0.1"
+SCHEMA_VERSION: str = "0.2"
 
 
 class RequestLogEntry(BaseModel):
@@ -29,6 +29,7 @@ class ActiveCheckResult(BaseModel):
     target: str
     description: str = ""
     findings: list[Finding] = Field(default_factory=list)
+    observations: list[Observation] = Field(default_factory=list)
     requests_made: int = 0
     skipped_reason: str | None = None
     started_at: datetime

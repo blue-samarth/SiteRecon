@@ -130,6 +130,21 @@ class CaaAnalysis(BaseModel):
     complete: bool = True                    # False if an inconclusive lookup interrupted the climb
 
 
+class EmailTransportSecurity(BaseModel):
+    '''
+    Transport-security posture for mail: MTA-STS, SMTP TLS reporting, BIMI and DANE (TLSA on the MX hosts).
+    '''
+    mx_hosts: list[str] = Field(default_factory=list)       # MX hosts found (DANE is checked per host)
+    mta_sts_present: bool = False
+    mta_sts_id: str | None = None
+    tls_rpt_present: bool = False
+    tls_rpt_rua: list[str] = Field(default_factory=list)    # TLS-report destinations
+    bimi_present: bool = False
+    bimi_location: str | None = None                        # l= (brand logo SVG URL)
+    bimi_authority: str | None = None                       # a= (Verified Mark Certificate URL)
+    dane_mx: list[str] = Field(default_factory=list)        # MX hosts that publish a TLSA record
+
+
 class EmailSecurity(BaseModel):
     '''
     SPF, DMARC and DKIM observations.
@@ -137,6 +152,7 @@ class EmailSecurity(BaseModel):
     spf: SpfAnalysis
     dmarc: DmarcAnalysis
     dkim_selectors_checked: list[str]
+    transport: EmailTransportSecurity = Field(default_factory=EmailTransportSecurity)
     dkim_found: list[DkimSelectorResult] = Field(default_factory=list)
     dkim_note: str = (
         "DKIM selectors cannot be enumerated; only a small predefined list was checked. "

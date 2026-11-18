@@ -13,6 +13,8 @@ from recon.modules.dns import DnsCollector
 from recon.modules.dnssec import DnssecCollector
 from recon.modules.html import HtmlCollector, HtmlParser
 from recon.modules.http import HttpCollector, SecurityHeaderParser
+from recon.modules.render import Renderer
+from recon.modules.vulnscan import VulnerabilityScanner
 from recon.modules.javascript import (
     BUNDLE_SIGNATURES,
     AssetCollector,
@@ -56,7 +58,7 @@ __all__ = [
     "ServiceInventory", "CertificateParser", "RdapUnavailableError", "WhoisClient", "WhoisError",
     "WhoisParser",
     # v0.2
-    "DnssecCollector", "ResourcesCollector", "Crawler", "CookieCollector",
+    "DnssecCollector", "ResourcesCollector", "Crawler", "CookieCollector", "Renderer", "VulnerabilityScanner",
     "CookieParser", "RobotsRules", "RobotsParser", "SecurityTxtParser", "SitemapParser",
     "CtProvider", "CtProviderError", "CrtShProvider", "CertSpotterProvider", "CtCache",
     "AssetCollector", "BundleAnalyzer", "BundleSignature", "BUNDLE_SIGNATURES",

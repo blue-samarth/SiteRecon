@@ -56,3 +56,35 @@ def test_calibrate_does_not_touch_findings_without_resolvable_evidence():
     f = finding("a:sub", title="No refs", confidence=Confidence.HIGH)   # no evidence_refs
     calibrate([f], [])
     assert f.confidence is Confidence.HIGH
+
+
+# ------------------------------------------------------------------ state re-derivation
+
+from recon.analysis import recalc_states
+from recon.models.common import FindingState
+
+
+def test_recalc_states_follows_confidence_lowered_by_calibration():
+    # a CONFIRMED finding calibrated down to LOW must become SUSPECTED, not stay CONFIRMED
+    f = finding("a:sub", title="Indexed", confidence=Confidence.MEDIUM, refs=["o1"])
+    assert f.state is FindingState.CONFIRMED                 # derived from MEDIUM at construction
+    calibrate([f], [obs("o1", "shodan_internetdb", provider="Shodan", freshness=Freshness.HISTORICAL)])
+    assert f.confidence is Confidence.LOW
+    recalc_states([f])
+    assert f.state is FindingState.SUSPECTED                 # re-derived from the lowered confidence
+
+
+def test_recalc_states_follows_confidence_raised_by_correlation():
+    out = correlate([finding("a:sub", title="Issue", confidence=Confidence.LOW),
+                     finding("b:sub", title="issue", confidence=Confidence.HIGH)])
+    assert out[0].confidence is Confidence.HIGH and out[0].state is FindingState.SUSPECTED  # kept's state stale
+    recalc_states(out)
+    assert out[0].state is FindingState.CONFIRMED           # re-derived from the raised confidence
+
+
+def test_recalc_states_leaves_corroborated_and_resolved_alone():
+    for keep in (FindingState.CORROBORATED, FindingState.RESOLVED, FindingState.FALSE_POSITIVE):
+        f = finding("a:sub", title="t", confidence=Confidence.LOW)
+        f.state = keep
+        recalc_states([f])
+        assert f.state is keep                               # history/review states are never overwritten

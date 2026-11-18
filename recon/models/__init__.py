@@ -8,6 +8,8 @@ from recon.models.assets import (
     SecretFinding,
     SkippedAsset,
 )
+from recon.models.render import RenderData, RenderedPage, RenderRequest
+from recon.models.vulns import VulnerabilityData, VulnerableComponent, VulnMatch
 from recon.models.common import (
     CollectionError,
     CollectionMethod,
@@ -30,6 +32,7 @@ from recon.models.dns import (
     DnsQueryStatus,
     DnsRecord,
     EmailSecurity,
+    EmailTransportSecurity,
     SpfAnalysis,
     SpfRecord,
 )
@@ -50,6 +53,8 @@ from recon.models.resources import (
 from recon.models.report import (
     SCHEMA_VERSION,
     AnalysisResult,
+    AreaGrade,
+    SecurityGrade,
     Finding,
     FindingDelta,
     InfrastructureObservation,
@@ -69,13 +74,13 @@ __all__ = [
     "ModuleResult", "ModuleStatus", "Severity", "utcnow",
     # dns
     "DkimSelectorResult", "DmarcAnalysis", "DnsData", "DnsQueryResult", "DnsQueryStatus",
-    "DnsRecord", "EmailSecurity", "SpfAnalysis", "SpfRecord",
+    "DnsRecord", "EmailSecurity", "EmailTransportSecurity", "SpfAnalysis", "SpfRecord",
     # html / http
     "HtmlData", "ResourceRef", "HttpData", "HttpHop", "HttpProbe", "SecurityHeader",
     # network
     "AsnInfo", "GeoLocation", "IpIntel", "NetworkData", "RdapNetwork",
     # report / analysis output
-    "SCHEMA_VERSION", "AnalysisResult", "Finding", "FindingDelta", "InfrastructureObservation", "ReconReport",
+    "SCHEMA_VERSION", "AnalysisResult", "AreaGrade", "SecurityGrade", "Finding", "FindingDelta", "InfrastructureObservation", "ReconReport",
     "TargetInfo", "ToolInfo",
     # subdomains / technology / third party / tls / whois
     "SubdomainData", "SubdomainRecord", "DetectionStatus", "TechEvidence", "Technology",
@@ -87,5 +92,6 @@ __all__ = [
     "FetchedResource", "ManifestInfo", "ResourcesData", "RobotsInfo", "SecurityTxtInfo", "SitemapInfo",
     "TextResourceInfo", "CtEntry", "HostState", "ProviderResult",
     "AssetData", "AssetRecord", "LibraryHit", "SkippedAsset", "EndpointRef", "ClientConfig",
-    "ClientConfigValue", "SecretFinding",
+    "ClientConfigValue", "SecretFinding", "RenderData", "RenderRequest", "RenderedPage",
+    "VulnerabilityData", "VulnerableComponent", "VulnMatch",
 ]

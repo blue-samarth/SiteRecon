@@ -47,7 +47,17 @@ class ActiveContext:
 
     def check_count(self, check_id: str) -> int: return self._per_check.get(check_id, 0)
     def log_probe(self, check_id: str, method: str, target: str, *, status: int | None = None, note: str | None = None) -> None: self.request_log.append(RequestLogEntry(check_id=check_id, method=method, url=target, status=status, note=note))
-    async def reserve_handshake(self, check_id: str) -> None: await self._reserve(check_id)
+
+    async def reserve(self, check_id: str) -> None:
+        '''
+        Reserve one request slot (budget + rate limiter) for a connect, handshake, trace or external
+        provider call the check will make through its own transport rather than :meth:`request`.
+        Parameters:
+            check_id (str): The check making the request.
+        Raises:
+            BudgetExceeded: If the run or per-check budget is exhausted (nothing is counted in that case).
+        '''
+        await self._reserve(check_id)
 
 
     async def _reserve(self, check_id: str) -> None:
@@ -103,11 +113,14 @@ class ActiveContext:
         self.request_log.append(entry)
         return resp
 
-    def record_external(self, check_id: str, method: str, url: str, *, status: int | None = None, note: str | None = None) -> None:
+    def log_external(self, check_id: str, method: str, url: str, *, status: int | None = None, note: str | None = None) -> None:
         '''
-        Record a request a check made through its *own* client (e.g. an external-intelligence provider call
-        to a third-party host), counting it toward the engagement total so the audit log and the reported
-        request count stay in lockstep.
+        Log a request a check made through its *own* client (e.g. an external-intelligence provider call to a
+        third-party host) that was already reserved against the budget via :meth:`reserve`, so the audit log
+        and the reported request count stay in lockstep (one reserved slot → one log row).
+
+        Unlike the old ``record_external``, this does not increment the counters: the slot is taken up front
+        by :meth:`reserve` before the request is sent, so the budget actually bounds provider traffic.
         Parameters:
             check_id (str): The check that made the request.
             method (str): HTTP method.
@@ -115,6 +128,4 @@ class ActiveContext:
             status (int | None): Response status, if any.
             note (str | None): Audit note.
         '''
-        self._total += 1
-        self._per_check[check_id] = self._per_check.get(check_id, 0) + 1
         self.request_log.append(RequestLogEntry(check_id=check_id, method=method.upper(), url=redact_url(url), status=status, note=note))

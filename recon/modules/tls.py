@@ -8,17 +8,30 @@ import asyncio
 import contextlib
 import ssl
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import ClassVar, TypeVar
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtensionOID, NameOID
 
 from recon.models import CertificateInfo, CollectionError, TlsData, TlsProbe
 from recon.modules.base import Collector
 from recon.utils import Resolve, is_public_ip, system_resolve
+
+
+@dataclass(slots=True)
+class _Handshake:
+    '''
+    What one TLS handshake observed (leaf cert plus session/transport details).
+    '''
+    der: bytes
+    version: str | None
+    cipher: str | None
+    alpn: str | None = None
+    chain_len: int | None = None
 
 _R = TypeVar("_R")
 
@@ -47,6 +60,11 @@ class CertificateParser:
         except x509.ExtensionNotFound:
             san_dns, san_ip = [], []
 
+        sct_count = 0
+        with contextlib.suppress(x509.ExtensionNotFound):
+            sct = cert.extensions.get_extension_for_oid(ExtensionOID.PRECERT_SIGNED_CERTIFICATE_TIMESTAMPS)
+            sct_count = len(sct.value)
+
         key_alg, key_size, curve = cls._public_key_details(cert)
         oid = cert.signature_algorithm_oid
         return CertificateInfo(
@@ -68,6 +86,7 @@ class CertificateParser:
             public_key_curve=curve,
             fingerprint_sha256=cert.fingerprint(hashes.SHA256()).hex(":").upper(),
             self_issued=cert.subject == cert.issuer,
+            sct_count=sct_count,
         )
 
     @staticmethod
@@ -207,15 +226,13 @@ class TlsCollector(Collector[TlsData]):
         ip = probe.ip = allowed[0]  # connect to the vetted address, not a fresh resolution
 
         try:
-            der, version, cipher = await self._with_retries(
-                lambda: self._handshake(ip, hostname, port, verify=True))
+            hs = await self._with_retries(lambda: self._handshake(ip, hostname, port, verify=True))
             probe.verified = True
         except ssl.SSLCertVerificationError as exc:
             probe.verified = False
             probe.verification_error = exc.verify_message or str(exc)
             try:
-                der, version, cipher = await self._with_retries(
-                    lambda: self._handshake(ip, hostname, port, verify=False))
+                hs = await self._with_retries(lambda: self._handshake(ip, hostname, port, verify=False))
             except (ssl.SSLError, OSError) as inner:
                 probe.error, probe.error_type = str(inner), type(inner).__name__
                 return probe
@@ -224,8 +241,11 @@ class TlsCollector(Collector[TlsData]):
             return probe
 
         probe.success = True
-        probe.tls_version, probe.cipher = version, cipher
-        cert = CertificateParser.parse(der)
+        probe.tls_version, probe.cipher, probe.alpn = hs.version, hs.cipher, hs.alpn
+        probe.forward_secret = self._forward_secret(hs.version, hs.cipher)
+        probe.chain_length = hs.chain_len
+        probe.chain_complete = (hs.chain_len > 1) if hs.chain_len is not None else None
+        cert = CertificateParser.parse(hs.der)
         probe.certificate = cert
         current = self.now or datetime.now(UTC)
         probe.currently_valid = cert.not_before <= current <= cert.not_after
@@ -253,7 +273,24 @@ class TlsCollector(Collector[TlsData]):
                     raise
                 await asyncio.sleep(0.5 * 2 ** (attempt - 1))
 
-    async def _handshake(self, ip: str, hostname: str, port: int, verify: bool) -> tuple[bytes, str | None, str | None]:
+    @staticmethod
+    def _forward_secret(version: str | None, cipher: str | None) -> bool | None:
+        '''
+        Whether the negotiated cipher provides forward secrecy (every TLS 1.3 suite does; otherwise ECDHE/DHE).
+        Parameters:
+            version (str | None): Negotiated TLS version.
+            cipher (str | None): Negotiated cipher name.
+        Returns:
+            bool | None: True/False, or None when the cipher is unknown.
+        '''
+        if not cipher:
+            return None
+        if version == "TLSv1.3":
+            return True
+        upper = cipher.upper()
+        return "ECDHE" in upper or "DHE" in upper
+
+    async def _handshake(self, ip: str, hostname: str, port: int, verify: bool) -> _Handshake:
         '''
         Perform one non-blocking TLS handshake and return the leaf certificate and session details.
         Parameters:
@@ -262,12 +299,14 @@ class TlsCollector(Collector[TlsData]):
             port (int): TCP port.
             verify (bool): Verify the chain and hostname.
         Returns:
-            tuple[bytes, str | None, str | None]: DER certificate, TLS version and cipher name.
+            _Handshake: DER certificate, TLS version, cipher, ALPN and the sent-chain length.
         Raises:
             ssl.SSLError | OSError: On handshake or connection failure.
             TimeoutError: If connecting or the handshake exceeds the timeout.
         '''
         ctx = ssl.create_default_context()
+        with contextlib.suppress(NotImplementedError, ssl.SSLError):
+            ctx.set_alpn_protocols(["h2", "http/1.1"])   # learn which application protocol the server offers
         if not verify:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -282,7 +321,11 @@ class TlsCollector(Collector[TlsData]):
             if der is None:
                 raise ssl.SSLError("server presented no certificate")
             cipher = tls.cipher()
-            return der, tls.version(), cipher[0] if cipher else None
+            chain_len: int | None = None
+            with contextlib.suppress(Exception):   # get_unverified_chain is 3.13+ and may be unavailable
+                chain_len = len(tls.get_unverified_chain() or [])
+            return _Handshake(der=der, version=tls.version(), cipher=cipher[0] if cipher else None,
+                              alpn=tls.selected_alpn_protocol(), chain_len=chain_len)
         finally:
             writer.close()
             with contextlib.suppress(OSError, ssl.SSLError, TimeoutError):

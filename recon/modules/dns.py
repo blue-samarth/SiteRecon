@@ -23,6 +23,7 @@ from recon.models import (
     DnsQueryResult,
     DnsQueryStatus,
     EmailSecurity,
+    EmailTransportSecurity,
     SpfAnalysis,
     SpfRecord,
 )
@@ -67,6 +68,9 @@ class DnsCollector(Collector[DnsData]):
             for rtype in self.RECORD_TYPES:
                 jobs[rtype] = tg.create_task(self.client.query(host, rtype))
             jobs["DMARC"] = tg.create_task(self.client.query(f"_dmarc.{host}", "TXT"))
+            jobs["MTA_STS"] = tg.create_task(self.client.query(f"_mta-sts.{host}", "TXT"))
+            jobs["TLS_RPT"] = tg.create_task(self.client.query(f"_smtp._tls.{host}", "TXT"))
+            jobs["BIMI"] = tg.create_task(self.client.query(f"default._bimi.{host}", "TXT"))
             if not host.startswith("www."):
                 jobs["CNAME(www)"] = tg.create_task(self.client.query(f"www.{host}", "CNAME"))
             dkim_jobs = {sel: tg.create_task(self.client.query(f"{sel}._domainkey.{host}", "TXT"))
@@ -78,6 +82,7 @@ class DnsCollector(Collector[DnsData]):
         spf = self.parse_spf(queries["TXT"])
         caa = await self._climb_caa(queries["CAA"])
         await self._evaluate_spf(spf)
+        transport = await self._mail_transport(queries)
 
         errors: list[CollectionError] = [
             self.error(f"{q.name} {q.record_type}", q.status.value, q.error or q.status.value)
@@ -88,9 +93,62 @@ class DnsCollector(Collector[DnsData]):
             spf=spf,
             dmarc=self.parse_dmarc(queries["DMARC"]),
             dkim_selectors_checked=list(self.dkim_selectors),
+            transport=transport,
             dkim_found=[self.parse_dkim(sel, q) for sel, q in dkim_results.items() if self._first_dkim(q)],
         )
         return DnsData(hostname=host, queries=queries, email=email, caa=caa), errors
+
+    # ------------------------------------------------------------------ mail transport (MTA-STS/TLS-RPT/BIMI/DANE)
+
+    async def _mail_transport(self, queries: dict[str, DnsQueryResult]) -> EmailTransportSecurity:
+        '''
+        Parse MTA-STS, TLS-RPT and BIMI records and probe DANE (TLSA on _25._tcp of each MX host).
+        Parameters:
+            queries (dict[str, DnsQueryResult]): Completed DNS results (MX, MTA_STS, TLS_RPT, BIMI).
+        Returns:
+            EmailTransportSecurity: The parsed mail-transport posture.
+        '''
+        def record(key: str, prefix: str) -> str | None:
+            q = queries.get(key)
+            return next((v for v in (q.values if q else []) if v.strip().lower().startswith(prefix)), None)
+
+        t = EmailTransportSecurity()
+        mx = queries.get("MX")
+        for value in (mx.values if mx else []):
+            host = (value.split()[-1] if value.split() else value).rstrip(".").lower()
+            if host and host != "." and host not in t.mx_hosts:
+                t.mx_hosts.append(host)
+
+        if (rec := record("MTA_STS", "v=stsv1")) is not None:
+            t.mta_sts_present, t.mta_sts_id = True, self._tag(rec, "id")
+        if (rec := record("TLS_RPT", "v=tlsrptv1")) is not None:
+            t.tls_rpt_present = True
+            t.tls_rpt_rua = [u.strip() for u in (self._tag(rec, "rua") or "").split(",") if u.strip()]
+        if (rec := record("BIMI", "v=bimi1")) is not None:
+            t.bimi_present = True
+            t.bimi_location, t.bimi_authority = self._tag(rec, "l"), self._tag(rec, "a")
+
+        for mx_host in t.mx_hosts[:5]:   # DANE: a TLSA record on the MX's SMTP port
+            tlsa = await self.client.query(f"_25._tcp.{mx_host}", "TLSA")
+            if tlsa.values:
+                t.dane_mx.append(mx_host)
+        return t
+
+    @staticmethod
+    def _tag(record: str, key: str) -> str | None:
+        '''
+        Read a `key=value` tag from a `;`-separated policy record (MTA-STS / TLS-RPT / BIMI).
+        Parameters:
+            record (str): The record text.
+            key (str): Tag name (case-insensitive).
+        Returns:
+            str | None: The tag value, or None.
+        '''
+        for part in record.split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name.strip().lower() == key:
+                return value.strip()
+        return None
 
     # ------------------------------------------------------------------ SPF
 

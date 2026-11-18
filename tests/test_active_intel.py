@@ -83,3 +83,37 @@ def test_redaction_includes_external_intelligence():
     from recon.active import redact_authorization
     summary = redact_authorization(auth(providers=["wayback"]))
     assert summary["external_intelligence"] == {"providers": ["wayback"]}
+
+
+async def test_intel_requests_are_bounded_by_the_engagement_budget():
+    # budget of 1 → the reservation stops provider traffic after one request (it is no longer counted
+    # only after the fact), and the one-log-row-per-counted-request invariant still holds
+    a = AuthorizationFile(
+        target="app.test", authorized_by="op", authorized_on="2026-11-08", window=WINDOW,
+        scope=ActiveScope(hosts=["app.test"]), checks_enabled=[EXTERNAL_INTELLIGENCE],
+        external_intelligence=ExternalIntelligence(providers=["wayback", "shodan_internetdb"]),
+        max_requests=1)
+    orch = ActiveOrchestrator(a, now=NOW, ips=["203.0.113.9"],
+                              intel_runner=intel_runner(["wayback", "shodan_internetdb"]))
+    with respx.mock:
+        respx.get(url__startswith="https://web.archive.org/cdx/search/cdx").mock(
+            return_value=httpx.Response(200, content=CDX))
+        respx.get("https://internetdb.shodan.io/203.0.113.9").mock(return_value=httpx.Response(200, json=SHODAN))
+        report = await orch.run()
+    assert report.requests_made == 1                          # the budget actually bounded provider traffic
+    assert len(report.request_log) == report.requests_made    # invariant: one log row per counted request
+    check = next(c for c in report.checks if c.check_id == EXTERNAL_INTELLIGENCE)
+    assert check.status is ModuleStatus.PARTIAL
+    assert any("budget" in (e.message or "").lower() for e in check.errors)
+
+
+async def test_intel_observations_are_retained_on_the_result():
+    orch = ActiveOrchestrator(auth(providers=["wayback"]), now=NOW, ips=["203.0.113.9"],
+                              intel_runner=intel_runner(["wayback"]))
+    with respx.mock:
+        respx.get(url__startswith="https://web.archive.org/cdx/search/cdx").mock(
+            return_value=httpx.Response(200, content=CDX))
+        report = await orch.run()
+    check = next(c for c in report.checks if c.check_id == EXTERNAL_INTELLIGENCE)
+    assert check.observations                                 # intel observations are no longer dropped
+    assert all(o.external_provider for o in check.observations)

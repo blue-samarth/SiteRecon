@@ -32,7 +32,9 @@ from recon.analysis import (
 from recon.config import ALL_MODULES, Config
 from recon.models import (
     AnalysisResult,
+    AssetData,
     CollectionError,
+    CrawlData,
     HttpData,
     ModuleResult,
     ModuleStatus,
@@ -53,11 +55,13 @@ from recon.modules import (
     HtmlCollector,
     HttpCollector,
     NetworkCollector,
+    Renderer,
     ResourcesCollector,
     SubdomainCollector,
     TechnologyCollector,
     ThirdPartyCollector,
     TlsCollector,
+    VulnerabilityScanner,
     WhoisCollector,
 )
 from recon.storage import ScanStore
@@ -249,6 +253,11 @@ class ScanOrchestrator:
 
         crawl = crawler_result.data
         assets = assets_result.data
+        render_result = await self._maybe("render", lambda: Renderer(
+            self._render_seeds(origin, crawl, cfg.render_max_pages), host, timeout=cfg.render_timeout,
+            max_pages=cfg.render_max_pages, user_agent=cfg.user_agent,
+            retain_client_keys=cfg.retain_client_keys))
+        vulnscan_result = await self._run_vulnscan(cfg, assets)
         technology_result = await self._maybe("technology", lambda: TechnologyCollector(
             http, html_result.data, crawl=crawl, dns=dns_result.data, assets=assets))
         cookies_result = await self._maybe("cookies", lambda: CookieCollector(http, crawl),
@@ -266,7 +275,8 @@ class ScanOrchestrator:
             dns=dns_result, network=network_result, http=http_result, tls=tls_result, whois=whois_result,
             html=html_result, technology=technology_result, subdomains=subdomains_result,
             third_party=third_party_result, dnssec=dnssec_result, resources=resources_result,
-            crawler=crawler_result, cookies=cookies_result, javascript=assets_result,
+            crawler=crawler_result, cookies=cookies_result, javascript=assets_result, render=render_result,
+            vulnscan=vulnscan_result,
             analysis=AnalysisResult(),
             limitations=list(self.LIMITATIONS),
         )
@@ -276,6 +286,7 @@ class ScanOrchestrator:
             whois=whois_result.data, html=html_result.data, subdomains=subdomains_result.data,
             dnssec=dnssec_result.data, resources=resources_result.data, crawl=crawl,
             cookies=cookies_result.data, assets=assets, third_party=third_party_result.data,
+            render=render_result.data, vulnerabilities=vulnscan_result.data,
             observations=report.observations,
         )
         report.errors = [e for m in report.module_results().values() for e in m.errors]
@@ -300,6 +311,47 @@ class ScanOrchestrator:
                 if parts.scheme == "https" and self.scope.allows(parts.hostname):
                     return f"https://{parts.netloc}"
         return f"https://{host}"
+
+    async def _run_vulnscan(self, cfg: Config, assets: AssetData | None) -> ModuleResult[Any]:
+        '''
+        Run the OSV vulnerability lookup over the detected components, behind an api.osv.dev-scoped client.
+        Parameters:
+            cfg (Config): Runtime config (gates the module and supplies client settings).
+            assets (AssetData | None): Static asset analysis carrying the detected libraries.
+        Returns:
+            ModuleResult[Any]: The vulnscan result (SKIPPED when the module is disabled).
+        '''
+        if not cfg.enabled("vulnscan"):
+            return await self._maybe("vulnscan", lambda: None)   # not enabled → SKIPPED, lambda never called
+        client = SafeHttpClient(Scope(hosts=["api.osv.dev"]),
+                                **{**self._client_kwargs, "allow_private_networks": False})
+        async with client:
+            return await self._maybe("vulnscan", lambda: VulnerabilityScanner(assets, client))
+
+    @staticmethod
+    def _render_seeds(origin: str, crawl: CrawlData | None, limit: int) -> list[str]:
+        '''
+        Pages to render: the origin homepage plus distinct in-scope crawled routes (scheme://host/path, no
+        query), so rendering spans the app's pages rather than only the landing page.
+        Parameters:
+            origin (str): The target origin, e.g. 'https://example.com'.
+            crawl (CrawlData | None): Crawl results, if the crawler ran.
+            limit (int): Maximum number of pages to render.
+        Returns:
+            list[str]: Distinct page URLs to render, origin first.
+        '''
+        seeds: list[str] = [origin + "/"]
+        seen: set[str] = {urlsplit(seeds[0]).path or "/"}
+        for page in crawl.pages if crawl else []:
+            parts = urlsplit(page.url)
+            path = parts.path or "/"
+            if path in seen or not parts.netloc:
+                continue
+            seen.add(path)
+            seeds.append(f"{parts.scheme}://{parts.netloc}{path}")
+            if len(seeds) >= limit:
+                break
+        return seeds
 
     def options(self) -> dict[str, Any]:
         '''

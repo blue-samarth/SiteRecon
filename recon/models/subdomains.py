@@ -68,6 +68,11 @@ class SubdomainRecord(BaseModel):
     tls_ok: bool | None = None
     tls_hostname_match: bool | None = None
     tls_error: str | None = None
+    # Subdomain-takeover assessment (only when verification ran)
+    cname: str | None = None                 # CNAME target, if the name is a CNAME
+    takeover_provider: str | None = None     # takeover-prone provider the CNAME points at, if any
+    takeover_vulnerable: bool = False        # confirmed unclaimed (fingerprint) or dangling (target gone)
+    takeover_detail: str | None = None       # human-readable explanation of the assessment
 
 
 class SubdomainData(BaseModel):
