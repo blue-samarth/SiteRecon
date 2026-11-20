@@ -28,12 +28,17 @@ Typed as `str` (a new collector can introduce a value without a model change); t
 `CollectionMethod` enum:
 
 `dns_query`, `network_lookup` (ASN/RDAP/PTR), `http_request`, `tls_handshake`, `whois_lookup`, `ct_log`,
-`static_analysis` (parsing already-fetched HTML/JS), `derived` (inferred from other observations),
+`static_analysis` (parsing already-fetched HTML/JS, which is also how the SEO audit is stamped),
+`derived` (inferred from other observations),
 `external_api` (third-party provider), `browser_render` (Playwright), `port_connect`, `traceroute`,
 `unknown`.
 
-Passive collectors are stamped automatically in `ObservationBuilder._add`. External-intelligence and
-active collectors set their own method (and, for providers, `external_provider` and `expires_at`).
+Passive collectors are stamped automatically in `ObservationBuilder._add` from the module name, and a
+handler overrides that default where one module has several genuinely different provenances. Subdomain
+discovery is the clearest case: the same `subdomain` observation type carries `ct_log` when a certificate
+named the host, `external_api` when only a passive dataset knows it, and `dns_query` when the name was
+generated locally and confirmed by a lookup. External-intelligence and active collectors set their own
+method (and, for providers, `external_provider` and `expires_at`).
 
 ### Confidence vs. freshness vs. source
 
@@ -117,7 +122,9 @@ Two small passes run at the end of analysis, before the findings are reported:
   by code and subject upstream; this catches the same issue reported under different codes).
 - **Calibration** lowers a finding's confidence by one level when *all* of its supporting evidence is stale
   or historical external-provider data — such data is less certain than a live observation. Fresh or
-  multi-sourced evidence is left alone.
+  multi-sourced evidence is left alone. This is why `historical.*` findings (built entirely from web
+  archives) settle at low or medium confidence even when the extraction itself is exact: the extraction is
+  certain, the third party's record of the past is not.
 
 ## For new collectors
 
@@ -128,3 +135,8 @@ Two small passes run at the end of analysis, before the findings are reported:
 - Build `Finding`s with evidence and `evidence_refs`; let `state` derive from `confidence` unless you have
   a reason to set it.
 - Keep secrets and session material out of observations — store a type and fingerprint, never the value.
+  This applies to data retrieved *about* the target too: an archived URL can carry a real token in its query
+  string, so the `historical` module redacts query values and records parameter names only.
+- Summarize high-churn collections rather than emitting one observation per item. Archived URLs are a
+  worked example: the summary, endpoint surface, parameter classes and technology hints are comparable
+  across scans, while a per-URL diff of thousands of archive entries would bury the real changes.

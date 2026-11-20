@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 from recon.analysis.correlation import calibrate, correlate, recalc_states
 from recon.analysis.grading import compute_grade
 from recon.analysis.findings import FindingCollector
+from recon.analysis.seo_checks import CHECKS_BY_ID
+from recon.analysis.seo_grading import compute_seo_grade, run_checks
 from recon.analysis.tech_signatures import SIGNATURES_VERSION
 from recon.analysis.trackers import PRIVACY_SENSITIVE, TrackerCategory, classify_tracker
 from recon.analysis.waf import detect_wafs
@@ -21,6 +23,7 @@ from recon.analysis.signatures import (
 )
 from recon.models import (
     AnalysisResult,
+    CloudResource,
     Confidence,
     DmarcAnalysis,
     DnsData,
@@ -29,6 +32,7 @@ from recon.models import (
     DomainRegistration,
     Finding,
     HtmlData,
+    HistoricalData,
     HttpData,
     HttpProbe,
     InfrastructureObservation,
@@ -48,6 +52,9 @@ from recon.models import (
     Observation,
     ResourcesData,
     AssetData,
+    SeoData,
+    SeoCheck,
+    SeoGrade,
 )
 
 HSTS_RECOMMENDED_MAX_AGE: int = 15_552_000  # 180 days
@@ -162,6 +169,7 @@ class AnalysisEngine:
                 crawl: CrawlData | None = None, cookies: CookieData | None = None,
                 assets: AssetData | None = None, third_party: ThirdPartyData | None = None,
                 render: RenderData | None = None, vulnerabilities: VulnerabilityData | None = None,
+                historical: HistoricalData | None = None, seo: SeoData | None = None,
                 observations: list[Observation] | None = None,
                 ) -> AnalysisResult:
         '''
@@ -182,7 +190,14 @@ class AnalysisEngine:
             crawl (CrawlData | None): Crawl results.
             cookies (CookieData | None): Cookie attribute results.
             assets (AssetData | None): Static JS/CSS asset analysis.
-            third_party (ThirdPartyData | None): Third-party service inventory (classified into trackers).
+            third_party (ThirdPartyData | None): Third-party service inventory (classified into trackers)
+                and the managed-cloud resource inventory.
+            render (RenderData | None): Headless-browser render results.
+            vulnerabilities (VulnerabilityData | None): OSV lookup results.
+            historical (HistoricalData | None): Archived-URL surface from web archives and URL indexes.
+            seo (SeoData | None): On-page SEO evidence for the analyzed pages. When present, the SEO check
+                table is run over it and its own grade is attached to the result, separate from the
+                security grade.
             observations (list[Observation] | None): Normalized observations used as evidence references.
         Returns:
             AnalysisResult: A structured report containing findings, inferred infrastructure, and severity counts.
@@ -207,10 +222,14 @@ class AnalysisEngine:
         if crawl: self._analyze_crawl(crawl, http, findings)
         if cookies: self._analyze_cookies(cookies, findings)
         if assets: self._analyze_assets(assets, findings)
-        if third_party: self._analyze_trackers(third_party, html, findings)
+        if third_party:
+            self._analyze_trackers(third_party, html, findings)
+            self._analyze_cloud(third_party, host, findings)
         if network: self._analyze_hosting(network, host, findings)
         if render: self._analyze_render(render, host, findings)
         if vulnerabilities: self._analyze_vulnerabilities(vulnerabilities, host, findings)
+        if historical: self._analyze_historical(historical, findings)
+        seo_grade: SeoGrade | None = self._analyze_seo_site(seo, findings) if seo else None
         if observations: findings.link(observations)
 
         infrastructure: list[InfrastructureObservation] = InfrastructureInference.infer(
@@ -222,7 +241,7 @@ class AnalysisEngine:
 
         return AnalysisResult(findings=ordered, infrastructure=infrastructure,
                               severity_counts={s.value: counts.get(s.value, 0) for s in Severity},
-                              grade=compute_grade(ordered))
+                              grade=compute_grade(ordered), seo=seo_grade)
 
     @staticmethod
     def _analyze_email_transport(dns: DnsData, f: FindingCollector) -> None:
@@ -752,6 +771,62 @@ class AnalysisEngine:
                   evidence=[f"page: {page}", f"canonical: {html.canonical}"], source=source)
 
     @staticmethod
+    def _analyze_seo_site(seo: SeoData, f: FindingCollector) -> SeoGrade | None:
+        '''
+        Run the SEO check table over the analyzed pages: one finding per failing check, plus the grade.
+
+        Only failing checks produce findings. A check that could not be evaluated is reported in the
+        grade's check list with the reason, never as a finding, so an absent crawl reads as "not looked
+        at" rather than "clean". The coverage of the audit is itself reported as a finding, because a
+        site-wide count drawn from one page is the easiest number in this report to over-read.
+        Parameters:
+            seo (SeoData): On-page SEO evidence.
+            f (FindingCollector): Collector to add findings to.
+        Returns:
+            SeoGrade | None: The SEO grade, or None when no check could be evaluated.
+        '''
+        checks: list[SeoCheck] = run_checks(seo)
+        source = f"SEO audit of {seo.pages_analyzed} page(s) ({seo.pages_source})"
+        for row in checks:
+            if row.status != "fail":
+                continue
+            spec = CHECKS_BY_ID[row.id]
+            evidence: list[str] = []
+            if row.scope == "page":
+                evidence.append(f"{row.affected} of {row.checked} analyzed page(s) affected")
+            if row.detail:
+                evidence.append(row.detail)
+            evidence += row.samples[:8]
+            f.add(f"seo.{row.id}", seo.host, category="seo", title=spec.title,
+                  description=spec.description, severity=spec.severity, confidence=spec.confidence,
+                  evidence=evidence, source=source)
+        if seo.pages_analyzed < 2:
+            f.add("seo.coverage_single_page", seo.host, category="seo",
+                  title="SEO audit covered one page only",
+                  description="Only the landing page was available, so every site-wide check (duplicate "
+                              "titles, internal links, sitemap coverage) had nothing to compare and was "
+                              "skipped rather than passed. Re-run with --crawl for a site-wide audit.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"pages analyzed: {seo.pages_analyzed}",
+                            (f"checks skipped for lack of evidence: "
+                             f"{sum(1 for c in checks if c.status == 'not_checked')} of {len(checks)}")],
+                  source=source)
+        elif seo.crawl_page_limit_reached:
+            f.add("seo.coverage_truncated", seo.host, category="seo",
+                  title="SEO audit covered only part of the site",
+                  description="The crawl stopped at its page limit, so every count here describes the "
+                              "pages that were analyzed, not the whole site. Raise --max-pages (and "
+                              "--depth) for wider coverage before treating a count as complete.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"pages analyzed: {seo.pages_analyzed}",
+                            f"crawl depth limit: {seo.crawl_max_depth}",
+                            f"sitemap lists {seo.sitemap.sitemap_urls} URL(s), "
+                            f"{seo.sitemap.in_sitemap_not_crawled} of them not reached"
+                            if seo.sitemap and seo.sitemap.sitemap_urls else "no sitemap to compare with"],
+                  source=source)
+        return compute_seo_grade(seo, checks)
+
+    @staticmethod
     def _analyze_open_graph(html: HtmlData, f: FindingCollector) -> None:
         '''
         Flag missing, incomplete or malformed Open Graph / Twitter social-card metadata on the landing page.
@@ -850,6 +925,192 @@ class AnalysisEngine:
                   severity=Severity.LOW, confidence=Confidence.HIGH,
                   evidence=["http:// requests to: " + ", ".join(mixed[:15])],
                   source="headless-browser runtime requests")
+
+    @staticmethod
+    def _analyze_cloud(third_party: ThirdPartyData, host: str | None, f: FindingCollector) -> None:
+        '''
+        Interpret the managed-cloud inventory: what the application points at, grouped by what each class of
+        resource actually risks.
+
+        Severity reflects what a *reference* justifies, which is never "exposed". An object-storage bucket
+        wired into client code is LOW: buckets are the most common accidental-exposure class, so it is worth
+        checking, but nothing here says this one is readable. A function endpoint is LOW for the same reason.
+        A direct database/backend endpoint is MEDIUM, because that pattern moves authorization entirely into
+        provider-side rules (row-level security, storage rules) where a default-open configuration exposes
+        data to anyone holding the public client key — and the key is in the bundle by design. Confidence is
+        MEDIUM throughout: the reference is certain, its security consequence is not.
+        Parameters:
+            third_party (ThirdPartyData): Inventory carrying the cloud resources.
+            host (str | None): Target hostname (finding subject).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        resources = third_party.cloud_resources
+        if not resources:
+            return
+        subject = host or "cloud"
+        f.add("cloud.inventory", subject, category="cloud", title=f"{len(resources)} managed-cloud resource(s) referenced",
+              description=("The application references these managed-cloud endpoints. This is an inventory of "
+                           "the cloud surface reachable from the client, assembled from references only — "
+                           "SiteRecon did not contact any of them, so nothing here states that a resource is "
+                           "reachable, readable or even still provisioned."),
+              severity=S.INFORMATIONAL, confidence=C.HIGH,
+              evidence=[f"{r.provider} {r.kind}: {r.identifier}"
+                        + (f" ({r.region})" if r.region else "")
+                        + f" — via {', '.join(r.sources)}" for r in resources[:25]],
+              source="references in collected pages, bundles, CSP and DNS")
+
+        def group(kinds: tuple[str, ...]) -> list[CloudResource]:
+            return [r for r in resources if r.kind in kinds]
+
+        buckets = group(("object_storage",))
+        if buckets:
+            public = [r for r in buckets if r.public_by_default]
+            f.add("cloud.object_storage_referenced", subject, category="cloud",
+                  title="Object-storage bucket(s) referenced from client-side code",
+                  description=("Client-side code or page markup points directly at object storage. Buckets are "
+                               "the most frequent accidental-exposure class in cloud deployments: listing is "
+                               "often left enabled, and objects uploaded later inherit whatever policy is in "
+                               "place. Verify each bucket's access policy and that only intentionally public "
+                               "objects are served. The reference itself is not an exposure, and SiteRecon did "
+                               "not request these buckets."),
+                  severity=S.LOW, confidence=C.MEDIUM,
+                  evidence=[f"{r.provider}: {r.identifier}" + (f" [{r.region}]" if r.region else "")
+                            + (" — this class is world-readable unless restricted" if r.public_by_default else "")
+                            + f" (via {', '.join(r.sources)})" for r in (public + [b for b in buckets if b not in public])[:20]],
+                  source="bucket hostnames and URLs referenced in collected evidence")
+
+        functions = group(("serverless_function", "edge_worker"))
+        if functions:
+            f.add("cloud.serverless_endpoint", subject, category="cloud",
+                  title=f"{len(functions)} serverless/edge endpoint(s) callable from the browser",
+                  description=("The client references these serverless function or edge-worker endpoints, so "
+                               "they are part of the application's externally reachable surface. Each needs its "
+                               "own authentication, authorization and rate limiting — the browser is not a "
+                               "trust boundary. Whether any of them answers an unauthenticated request was NOT "
+                               "tested here; `siterecon active` has a bounded check for that."),
+                  severity=S.LOW, confidence=C.MEDIUM,
+                  evidence=[f"{r.provider}: {r.identifier}" + (f" [{r.region}]" if r.region else "")
+                            + f" (via {', '.join(r.sources)})" for r in functions[:20]],
+                  source="function endpoints referenced in collected evidence")
+
+        backends = group(("managed_database",))
+        if backends:
+            f.add("cloud.backend_endpoint", subject, category="cloud",
+                  title="Managed database/backend reached directly from the client",
+                  description=("The browser talks straight to a managed database or backend-as-a-service "
+                               "endpoint. In this pattern there is no server-side gatekeeper: the public client "
+                               "key ships in the bundle by design, and the provider's own rules (row-level "
+                               "security, database/storage rules, role permissions) are the only thing standing "
+                               "between an anonymous caller and the data. A default-open or missing policy "
+                               "exposes everything that endpoint can read. SiteRecon did not query these "
+                               "endpoints; confirming the rules requires an authorized active check."),
+                  severity=S.MEDIUM, confidence=C.MEDIUM,
+                  evidence=[f"{r.provider}: {r.identifier}" + (f" [{r.region}]" if r.region else "")
+                            + f" (via {', '.join(r.sources)})" for r in backends[:20]],
+                  source="backend endpoints referenced in collected evidence")
+
+    @staticmethod
+    def _analyze_historical(historical: HistoricalData, f: FindingCollector) -> None:
+        '''
+        Interpret the archived-URL surface: what used to be reachable, and which of it still deserves a look.
+
+        Every finding here is scoped to the past on purpose. Archives prove a URL was once fetchable, so the
+        severity reflects what that history implies rather than a current exposure: the inventory is
+        informational, sensitive-looking archived paths are LOW (worth verifying), and a credential-shaped
+        query parameter is MEDIUM — if a real secret ever travelled in a URL it is now sitting in third-party
+        archives, proxy logs and browser history, and rotation is the only fix. Confidence stays at MEDIUM or
+        below because the evidence is a third party's record of a path, not an observation of this site today.
+        Parameters:
+            historical (HistoricalData): Archived-URL results.
+            f (FindingCollector): Collector to add findings to.
+        '''
+        host = historical.host
+        live = [s.source for s in historical.sources if s.status == "live"]
+        failed = [s for s in historical.sources if s.status in ("failed", "skipped")]
+        if historical.urls_seen:
+            window = " to ".join(filter(None, [
+                historical.first_seen.date().isoformat() if historical.first_seen else None,
+                historical.last_seen.date().isoformat() if historical.last_seen else None])) or "unknown dates"
+            f.add("historical.archived_urls", host, category="historical",
+                  title=f"{historical.urls_seen} archived URL(s) across {len(live)} archive(s)",
+                  description=("Web archives and URL indexes hold these URLs for the domain. They map the "
+                               "endpoint and parameter surface the site exposed over time, including routes "
+                               "that are no longer linked from anywhere. This is evidence of the past: a URL "
+                               "here may 404 today, and the archive's coverage is not exhaustive."),
+                  severity=S.INFORMATIONAL, confidence=C.MEDIUM,
+                  evidence=[f"sources: {', '.join(live) or 'none'}", f"date range: {window}",
+                            f"{len(historical.hosts)} hostname(s), {len(historical.paths)} distinct path(s)",
+                            f"{len(historical.endpoints)} API-looking path(s)"]
+                           + [f"endpoint: {p}" for p in historical.endpoints[:10]]
+                           + ([f"extensions: {', '.join(f'{k} ({v})' for k, v in list(historical.extensions.items())[:8])}"]
+                              if historical.extensions else []),
+                  source=", ".join(live) or "web archives")
+
+        if historical.sensitive_paths:
+            f.add("historical.sensitive_path", host, category="historical",
+                  title="Sensitive-looking paths exist in web archives",
+                  description=("Archives hold URLs whose names suggest backups, database dumps, configuration "
+                               "or key material that was publicly fetchable at some point. Confirm whether each "
+                               "is still reachable; if a secret-bearing file was ever public, treat the secret "
+                               "as compromised regardless of whether the file is reachable now."),
+                  severity=S.LOW, confidence=C.MEDIUM, evidence=historical.sensitive_paths[:15],
+                  source=", ".join(live) or "web archives")
+
+        credentials = [p for p in historical.parameters if p.category == "credential"]
+        if credentials:
+            f.add("historical.credential_in_url", host, category="historical",
+                  title="Credential-shaped query parameters in archived URLs",
+                  description=("Archived URLs carried query parameters whose names indicate tokens, keys, "
+                               "session identifiers or passwords. A secret placed in a URL is copied into web "
+                               "archives, proxy and CDN logs, browser history and outbound Referer headers, so "
+                               "it cannot be un-exposed by changing the application. Move these values out of "
+                               "the query string and rotate anything that was ever carried in one. The values "
+                               "themselves are redacted and never stored by SiteRecon, so the match is on the "
+                               "parameter name alone."),
+                  severity=S.MEDIUM, confidence=C.LOW,
+                  evidence=[f"{p.name} ({p.occurrences} URL(s); e.g. {p.paths[0] if p.paths else '—'})"
+                            for p in credentials[:12]],
+                  source=", ".join(live) or "web archives")
+
+        surface = [p for p in historical.parameters if p.category in ("redirect", "file")]
+        if surface:
+            f.add("historical.parameter_surface", host, category="historical",
+                  title="Redirect- and file-valued parameters in archived URLs",
+                  description=("These archived parameters took URLs or paths as values — the classic "
+                               "open-redirect, SSRF and file-inclusion surface. Their presence is not a "
+                               "vulnerability; it marks where to check that redirect targets are validated "
+                               "against an allow-list and that no parameter is mapped onto a filesystem path."),
+                  severity=S.INFORMATIONAL, confidence=C.MEDIUM,
+                  evidence=[f"{p.name} [{p.category}] ({p.occurrences} URL(s); e.g. {p.paths[0] if p.paths else '—'})"
+                            for p in surface[:15]],
+                  source=", ".join(live) or "web archives")
+
+        legacy = [h for h in historical.tech_hints
+                  if h.still_detected is not True and h.confidence is not Confidence.LOW]
+        if legacy:
+            f.add("historical.legacy_technology", host, category="historical",
+                  title="Archived URLs show a technology the current scan does not detect",
+                  description=("Archived paths and file extensions identify a stack that served this site at "
+                               "some point and that the current scan did not detect. Old handlers often survive "
+                               "a migration behind a new front end, unmaintained and unpatched. Confirm whether "
+                               "the legacy stack is still deployed; if it is not, make sure its routes fail "
+                               "closed rather than reaching a forgotten handler."),
+                  severity=S.LOW, confidence=C.LOW,
+                  evidence=[f"{h.name} ({h.category}, {h.occurrences} path(s), last archived "
+                            f"{h.last_seen.date().isoformat() if h.last_seen else 'unknown'}): "
+                            f"{', '.join(h.evidence[:3])}" for h in legacy[:12]],
+                  source=", ".join(live) or "web archives")
+
+        if failed:
+            f.add("historical.discovery_incomplete", host, category="historical",
+                  title="Some archive sources did not return results",
+                  description=("One or more historical sources failed or were skipped, so the archived surface "
+                               "below is narrower than the sources enabled would normally provide. Absence of a "
+                               "URL in this report is therefore not evidence it was never public."),
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"{s.source}: {s.status}" + (f" — {s.error or s.skip_reason}"
+                                                         if (s.error or s.skip_reason) else "") for s in failed],
+                  source="historical source outcomes")
 
     @staticmethod
     def _analyze_hosting(network: NetworkData, host: str | None, f: FindingCollector) -> None:
@@ -984,21 +1245,55 @@ class AnalysisEngine:
     @staticmethod
     def _analyze_subdomains(data: SubdomainData, f: FindingCollector) -> None:
         '''
-        Report CT-discovered hostnames that publicly resolve to private addresses.
+        Report discovered hostnames that publicly resolve to private addresses, takeover-prone CNAMEs,
+        incomplete source coverage, and hosts only the generated-candidate pass found.
         Parameters:
             data (SubdomainData): Subdomain discovery results.
             f (FindingCollector): Collector to which findings will be added.
         '''
+        target = data.query.lstrip("%.")
+        incomplete = [p for p in (*data.providers, *data.sources) if p.status in ("failed", "cached", "skipped")]
+        if incomplete:
+            # Saying "these N names exist" without saying "and one source never answered" overstates
+            # coverage; a reader needs to know the list is narrower than the sources enabled would give.
+            f.add("subdomains.discovery_incomplete", target, category="subdomains",
+                  title="Subdomain discovery coverage was incomplete",
+                  description=("One or more discovery sources failed, were served from cache, or were skipped, "
+                               "so the hostname list reflects less coverage than the enabled sources would "
+                               "normally provide. Absence of a name here is not evidence it does not exist."),
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"{p.provider} ({p.kind}): {p.status}"
+                            + (f" — {p.error or p.skip_reason}" if (p.error or p.skip_reason) else "")
+                            for p in incomplete],
+                  source="per-source discovery outcomes")
+
+        permutation_only = [r for r in data.hostnames
+                            if r.resolves and r.sources == ["permutation"]]
+        if permutation_only:
+            # A name that resolves but appears in no certificate and no passive dataset is usually
+            # infrastructure nobody inventoried — which is also infrastructure nobody is patching.
+            f.add("subdomains.unlisted_host", target, category="subdomains",
+                  title=f"{len(permutation_only)} resolving host(s) absent from every public dataset",
+                  description=("These hostnames resolve in DNS but were found in no certificate and no passive "
+                               "dataset — they were generated from the naming pattern of the names that were "
+                               "found, then confirmed by a DNS lookup. Hosts missing from public inventories "
+                               "are frequently forgotten environments (staging, admin, legacy) that are still "
+                               "reachable but no longer maintained. Confirm each is intended and inventoried. "
+                               "Only DNS was queried; none of these hosts was contacted over HTTP."),
+                  severity=S.LOW, confidence=C.MEDIUM,
+                  evidence=[f"{r.hostname} → {', '.join(r.addresses[:3])}" for r in permutation_only[:20]],
+                  source="generated candidate confirmed by DNS resolution")
+
         private = [r for r in data.hostnames if r.private_addresses]
         if private:
-            f.add("subdomains.private_address", data.query.lstrip("%."), category="subdomains",
+            f.add("subdomains.private_address", target, category="subdomains",
                   title="Public DNS names resolve to private addresses",
                   description="Hostnames from Certificate Transparency resolve publicly to internal "
                               "address space, which reveals internal naming/addressing. They were not "
                               "contacted.",
                   severity=S.INFORMATIONAL, confidence=C.HIGH,
                   evidence=[f"{r.hostname} → {', '.join(r.private_addresses)}" for r in private[:15]],
-                  source="crt.sh + DNS A/AAAA")
+                  source="discovery sources + DNS A/AAAA")
 
         for r in (x for x in data.hostnames if x.takeover_vulnerable):   # one high finding per vulnerable name
             f.add("subdomain.takeover", r.hostname, category="subdomains",
@@ -1012,7 +1307,7 @@ class AnalysisEngine:
 
         dangling = [r for r in data.hostnames if r.takeover_provider and not r.takeover_vulnerable]
         if dangling:
-            f.add("subdomain.dangling_cname", data.query.lstrip("%."), category="subdomains",
+            f.add("subdomain.dangling_cname", target, category="subdomains",
                   title="Subdomains delegate to takeover-prone providers",
                   description="These names CNAME to services commonly associated with dangling-record "
                               "takeovers. They appear claimed now; keep the backing resources provisioned, or "

@@ -15,6 +15,11 @@ from recon.models.report import AreaGrade
 # Points deducted per grade-affecting finding, by severity. Informational findings never lower a grade.
 _PENALTY: dict[Severity, int] = {Severity.CRITICAL: 50, Severity.HIGH: 25, Severity.MEDIUM: 10, Severity.LOW: 4,
                                  Severity.INFORMATIONAL: 0}
+# Categories graded elsewhere, excluded from the security grade entirely. SEO and social-preview
+# findings are content-quality signals: a missing meta description is not a weaker security posture, and
+# letting a site-wide SEO audit deduct from "exposure" would make the security number move for reasons
+# that have nothing to do with security. They get their own score (see recon.analysis.seo_grading).
+_UNGRADED: frozenset[str] = frozenset({"seo", "social"})
 # Finding category → posture area. Categories not listed fall under "exposure".
 _AREA: dict[str, str] = {
     "tls": "tls",
@@ -44,6 +49,9 @@ def letter(score: int) -> str:
 def compute_grade(findings: list[Finding]) -> SecurityGrade:
     '''
     Grade the posture from the finalized findings: per-area scores and one overall grade.
+
+    Findings in the categories graded separately (SEO, social previews) are skipped, so this number
+    reflects security posture only.
     Parameters:
         findings (list[Finding]): The report's findings.
     Returns:
@@ -52,6 +60,8 @@ def compute_grade(findings: list[Finding]) -> SecurityGrade:
     penalties: dict[str, int] = {a: 0 for a in _AREAS}
     counts: dict[str, int] = {a: 0 for a in _AREAS}
     for finding in findings:
+        if finding.category in _UNGRADED:
+            continue
         area = _AREA.get(finding.category, "exposure")
         deduction = _PENALTY.get(finding.severity, 0)
         if deduction:

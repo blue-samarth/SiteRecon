@@ -214,3 +214,116 @@ def test_findings_reference_supporting_observations():
     obs_by_id = {o.id: o for o in r.observations}
     assert dmarc.evidence_refs and all(obs_by_id[ref].module == "dns" for ref in dmarc.evidence_refs)
     assert dmarc.limitations is None and dmarc.recommendation.startswith("Publish a DMARC record")
+
+
+# ------------------------------------------------------------------ phase 1 data in the diff system
+
+from recon.models import (
+    HtmlData,
+    PermutationStats,
+    ProviderResult,
+    ResourceRef,
+    SubdomainData,
+    SubdomainRecord,
+)
+from recon.modules import HistoricalUrlCollector, ThirdPartyCollector, WaybackUrlSource
+
+
+def subdomain_data(records, sources=()):
+    return SubdomainData(
+        query="%.example.com", verification_limit=100, verified_count=len(records), certificates_seen=1,
+        providers=[ProviderResult(provider="crt.sh", status="live", entries=1, kind="ct")],
+        sources=list(sources), hostnames=records,
+        permutation=PermutationStats(enabled=True, generated=10, tested=10, resolved=0, limit=10,
+                                     wordlist_size=5))
+
+
+def phase1_report(scan_id, *, subdomains=None, third_party=None, historical=None, started=T0):
+    r = ReconReport(
+        scan_id=scan_id, tool=ToolInfo(name="t", version="0", user_agent="u"),
+        target=TargetInfo(input="example.com", hostname="example.com", scope=[]), options={},
+        started_at=started, finished_at=started, duration_ms=1,
+        dns=ModuleResult.skipped("dns", "x"), network=ModuleResult.skipped("network", "x"),
+        http=ModuleResult.skipped("http", "x"), tls=ModuleResult.skipped("tls", "x"),
+        whois=ModuleResult.skipped("whois", "x"), html=ModuleResult.skipped("html", "x"),
+        technology=ModuleResult.skipped("technology", "x"),
+        subdomains=mr("subdomains", subdomains) if subdomains else ModuleResult.skipped("subdomains", "x"),
+        third_party=mr("third_party", third_party) if third_party else ModuleResult.skipped("third_party", "x"),
+        historical=mr("historical", historical) if historical else ModuleResult.skipped("historical", "x"),
+        analysis=AnalysisResult())
+    r.observations = ObservationBuilder("example.com", r.module_results()).build()
+    return r
+
+
+def test_a_newly_discovered_subdomain_shows_up_as_added():
+    first = subdomain_data([SubdomainRecord(hostname="api.example.com", sources=["crt.sh"], state="resolving")])
+    second = subdomain_data([SubdomainRecord(hostname="api.example.com", sources=["crt.sh"], state="resolving"),
+                             SubdomainRecord(hostname="staging.example.com", sources=["permutation"],
+                                             state="resolving")])
+    prev = phase1_report("20260101T000000Z-aaaaaa", subdomains=first)
+    cur = phase1_report("20260102T000000Z-bbbbbb", subdomains=second, started=T0 + dt.timedelta(days=1))
+    changes = {(c.type, c.key): c for c in ScanComparator.compare(prev, cur).changes}
+    assert changes[("subdomain", "staging.example.com")].kind is ChangeKind.ADDED
+    # the generated-candidate pass is itself comparable, so a change in its yield is visible
+    assert ("subdomain.permutation", "summary") not in changes      # unchanged between the two scans
+
+
+def test_gaining_a_passive_source_is_visible_as_a_source_change():
+    before = subdomain_data([SubdomainRecord(hostname="api.example.com", sources=["crt.sh"], state="resolving")])
+    after = subdomain_data([SubdomainRecord(hostname="api.example.com", sources=["crt.sh", "otx"],
+                                            state="resolving")],
+                           sources=[ProviderResult(provider="otx", status="live", kind="passive_dns", names=1)])
+    prev = phase1_report("20260101T000000Z-aaaaaa", subdomains=before)
+    cur = phase1_report("20260102T000000Z-bbbbbb", subdomains=after, started=T0 + dt.timedelta(days=1))
+    changes = {(c.type, c.key): c for c in ScanComparator.compare(prev, cur).changes}
+    assert changes[("subdomain.sources", "sources")].kind is ChangeKind.MODIFIED
+    assert changes[("subdomain.coverage", "sources")].kind is ChangeKind.ADDED
+    # the host itself did not change state, only how many sources know about it
+    assert ("subdomain", "api.example.com") not in changes
+
+
+def test_a_new_cloud_resource_shows_up_as_added():
+    def cloud(url, host):
+        html = HtmlData(source_url="https://example.com/",
+                        resources=[ResourceRef(url=url, kind="image", host=host, same_site=False)])
+        return ThirdPartyCollector("example.com", dns=None, http=None, html=html, tls=None).build()
+
+    prev = phase1_report("20260101T000000Z-aaaaaa",
+                         third_party=cloud("https://assets.s3.amazonaws.com/a.png", "assets.s3.amazonaws.com"))
+    cur = phase1_report("20260102T000000Z-bbbbbb", started=T0 + dt.timedelta(days=1),
+                        third_party=cloud("https://backups.s3.amazonaws.com/b.zip", "backups.s3.amazonaws.com"))
+    kinds = {(c.type, c.key): c.kind for c in ScanComparator.compare(prev, cur).changes}
+    assert kinds[("cloud.resource", "Amazon S3|object_storage|backups")] is ChangeKind.ADDED
+    assert kinds[("cloud.resource", "Amazon S3|object_storage|assets")] is ChangeKind.REMOVED
+
+
+async def test_historical_observations_compare_across_scans():
+    class Archive(WaybackUrlSource):
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def fetch(self, client, hostname, limit):
+            return [self.row(u, "20200101000000", "200") for u in self.rows]
+
+    async def data(rows):
+        collected, _ = await HistoricalUrlCollector(
+            "example.com", object(), sources=[Archive(rows)], limit=50).collect()
+        return collected
+
+    first = await data(["https://example.com/a.php"])
+    second = await data(["https://example.com/a.php", "https://example.com/api/v1/x?token=t"])
+    prev = phase1_report("20260101T000000Z-aaaaaa", historical=first)
+    cur = phase1_report("20260102T000000Z-bbbbbb", historical=second, started=T0 + dt.timedelta(days=1))
+    changes = {(c.type, c.key): c for c in ScanComparator.compare(prev, cur).changes}
+    assert changes[("historical.endpoints", "paths")].kind is ChangeKind.ADDED
+    assert changes[("historical.parameter", "token")].kind is ChangeKind.ADDED
+    assert changes[("historical.summary", "urls")].kind is ChangeKind.MODIFIED
+
+
+def test_a_skipped_phase1_module_is_never_reported_as_a_removal():
+    # The honesty rule the whole diff system is built on: missing data is 'unknown', not 'removed'.
+    before = subdomain_data([SubdomainRecord(hostname="api.example.com", sources=["crt.sh"], state="resolving")])
+    prev = phase1_report("20260101T000000Z-aaaaaa", subdomains=before)
+    cur = phase1_report("20260102T000000Z-bbbbbb", started=T0 + dt.timedelta(days=1))   # subdomains skipped
+    kinds = {(c.type, c.key): c.kind for c in ScanComparator.compare(prev, cur).changes}
+    assert kinds[("subdomain", "api.example.com")] is ChangeKind.UNKNOWN

@@ -101,6 +101,53 @@ WAF_SIGNATURES: tuple[WafSignature, ...] = (
                  headers=(("x-azure-ref", ""),)),
     # ModSecurity (open-source engine, often behind Apache/Nginx)
     WafSignature("ModSecurity", _M, server=("mod_security", "modsecurity"), headers=(("x-mod-security", ""),)),
+    # AWS — an ALB/CloudFront header proves the edge, never that a WAF web ACL is attached to it.
+    WafSignature("AWS WAF", _M, "AWS edge present; a WAF web ACL may or may not be attached",
+                 headers=(("x-amzn-waf-action", ""),)),
+    WafSignature("AWS WAF", _H, "AWS WAF challenge/CAPTCHA cookie present",
+                 cookies=("aws-waf-token",)),
+    # Google Cloud Armor rides on the Google load balancer; only the deny response names it.
+    WafSignature("Google Cloud Armor", _M, "Google Cloud load balancer present; Cloud Armor policy not proven",
+                 headers=(("x-cloud-armor-", ""),)),
+    # Fortinet FortiWeb
+    WafSignature("FortiWeb", _H, cookies=("cookiesession1",), headers=(("x-fw-", ""),)),
+    # Citrix NetScaler AppFirewall — the ns_af cookies are the AppFirewall tell; plain NSC_ is load balancing.
+    WafSignature("Citrix NetScaler AppFirewall", _H, cookies=("ns_af",)),
+    WafSignature("Citrix NetScaler", _M, "NetScaler load balancer present; AppFirewall not proven",
+                 cookies=("nsc_",)),
+    # Radware AppWall
+    WafSignature("Radware AppWall", _H, headers=(("x-sl-compstate", ""),), cookies=("aaacookie",)),
+    # Reblaze
+    WafSignature("Reblaze", _H, cookies=("rbzid", "rbzsessionid")),
+    # DDoS-Guard
+    WafSignature("DDoS-Guard", _H, headers=(("x-ddg-", ""),), cookies=("__ddg1", "__ddg2")),
+    # Qrator
+    WafSignature("Qrator", _H, headers=(("x-qrator-ip", ""),), server=("qrator",)),
+    # StackPath / Edgio edge WAFs
+    WafSignature("StackPath", _M, "StackPath edge present; WAF rules not proven", server=("stackpath",)),
+    WafSignature("Edgio", _M, "Edgio/Edgecast edge present; WAF rules not proven", headers=(("x-ec-security", ""),)),
+    # Wallarm
+    WafSignature("Wallarm", _H, headers=(("x-wallarm-", ""),), server=("nginx-wallarm",)),
+    # SafeLine / Chaitin
+    WafSignature("SafeLine (Chaitin)", _H, headers=(("x-safeline-", ""),), cookies=("sl-session",)),
+    # Alibaba Cloud WAF
+    WafSignature("Alibaba Cloud WAF", _H, headers=(("x-aliyun-waf", ""),), cookies=("acw_sc__v2", "acw_tc")),
+    # Tencent Cloud WAF
+    WafSignature("Tencent Cloud WAF", _H, headers=(("x-tencent-waf", ""),), cookies=("tencentwaf",)),
+    # Yundun (Chinese cloud WAF)
+    WafSignature("Yundun", _H, headers=(("x-yd-waf-", ""),), server=("yundun",)),
+    # BitNinja
+    WafSignature("BitNinja", _H, server=("bitninja",), cookies=("bitninja_",)),
+    # NinjaFirewall / WordPress-layer WAFs
+    WafSignature("NinjaFirewall", _H, headers=(("x-ninjafirewall", ""),)),
+    WafSignature("All In One WP Security", _H, cookies=("aiowps_",)),
+    # Shield Security (WordPress)
+    WafSignature("Shield Security", _H, cookies=("icwp-wpsf",)),
+    # Open-appsec / NGINX App Protect
+    WafSignature("NGINX App Protect", _H, headers=(("x-nap-", ""),)),
+    # Astra
+    WafSignature("Astra", _H, headers=(("x-astra-", ""),), cookies=("cz_astra",)),
+    # Teclib / Varnish security barriers are intentionally omitted: too generic to attribute.
 )
 
 

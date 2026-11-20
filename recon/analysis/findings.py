@@ -56,6 +56,76 @@ RECOMMENDATIONS: dict[str, str] = {
     "seo.meta_description_missing": "Add a concise <meta name=\"description\"> summarizing the page.",
     "seo.noindex": "If this page should be discoverable, remove 'noindex' from its robots directive; confirm a staging setting was not shipped to production.",
     "seo.canonical_offsite": "Confirm the canonical URL intentionally points to another domain; otherwise correct it to this page's own canonical URL.",
+    # --- SEO audit (one entry per check in recon.analysis.seo_checks, plus the two coverage notes)
+    "seo.pages_blocked_from_indexing": "Confirm each blocked page is meant to be hidden; remove the "
+                                       "noindex directive, X-Robots-Tag header or robots.txt rule from any "
+                                       "page that should be findable.",
+    "seo.robots_blocked_pages": "Allow the URLs you publish to be crawled; use noindex on the page itself "
+                                "(which requires crawling to be read) rather than a robots.txt Disallow "
+                                "when the goal is to keep a page out of the index.",
+    "seo.canonical_missing": "Add a self-referencing rel=canonical link to each indexable page so "
+                             "parameter and slash variants consolidate onto one URL.",
+    "seo.canonical_not_self": "Point each page's canonical at itself unless it is deliberately a duplicate "
+                              "of another URL; check the template is not emitting one hardcoded canonical.",
+    "seo.canonical_offsite_pages": "Confirm the off-site canonical is intentional (syndicated content); "
+                                   "otherwise correct it to the page's own URL.",
+    "seo.sitemap_noindex_conflict": "Decide per URL: keep it in the sitemap and drop the noindex, or keep "
+                                    "the noindex and remove it from the sitemap.",
+    "seo.host_not_canonicalized": "Pick one hostname as canonical and 301-redirect the other to it, then "
+                                  "make sure canonical links and the sitemap use the chosen host.",
+    "seo.no_https_canonicalization": "Redirect all plain-HTTP requests to HTTPS with a 301 and serve HSTS.",
+    "seo.titles_missing": "Give every indexable page a unique, descriptive <title>.",
+    "seo.title_length": "Rewrite the flagged titles to describe the page within roughly 20–60 characters.",
+    "seo.duplicate_titles": "Make each page's title describe that page; fill the page name into the "
+                            "template instead of repeating a site-wide title.",
+    "seo.descriptions_missing": "Add a concise meta description summarizing each page.",
+    "seo.description_length": "Rewrite the flagged descriptions to roughly 70–160 characters.",
+    "seo.duplicate_descriptions": "Write a per-page description, or remove the duplicate one and let the "
+                                  "search engine build a snippet rather than repeating the same text.",
+    "seo.viewport_missing": "Add <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"> "
+                            "to every page template.",
+    "seo.lang_missing": "Set the lang attribute on <html> to the page's language.",
+    "seo.hreflang_invalid": "Correct the hreflang values to valid language[-script][-region] tags, make "
+                            "each alternate set self-referencing, and add an x-default entry.",
+    "seo.social_metadata_missing": "Add og:title, og:type, og:image and og:url to these page templates so "
+                                   "shared links render a controlled preview.",
+    "seo.h1_missing": "Add one H1 per page stating what the page is about.",
+    "seo.h1_multiple": "Keep one H1 per document and demote the others to H2/H3.",
+    "seo.heading_hierarchy": "Use heading levels in order (no skipping) so the document outline matches "
+                             "the visual structure.",
+    "seo.duplicate_h1": "Give each page its own H1; check for an unfilled template heading.",
+    "seo.thin_content": "Confirm each page is meant to be short; expand the ones that should rank, or mark "
+                        "genuinely thin utility pages noindex so they do not compete.",
+    "seo.images_missing_alt": "Add descriptive alt text to content images and an explicit alt=\"\" to "
+                              "decorative ones.",
+    "seo.structured_data_missing": "Add JSON-LD for the page types you have (Organization, Article, "
+                                   "Product, BreadcrumbList) to become eligible for rich results.",
+    "seo.structured_data_invalid": "Fix the malformed JSON-LD; an unparseable block is discarded whole.",
+    "seo.robots_txt_missing": "Publish a robots.txt, even a permissive one, and declare your sitemap in it.",
+    "seo.sitemap_missing": "Publish an XML sitemap of your indexable URLs and reference it from robots.txt.",
+    "seo.sitemap_not_declared": "Add a 'Sitemap: <url>' line to robots.txt.",
+    "seo.sitemap_coverage_gap": "Add the missing indexable URLs to the sitemap, or confirm they are "
+                                "intentionally excluded.",
+    "seo.sitemap_errors": "Remove dead URLs from the sitemap and fix the generation step that emitted "
+                          "them; a sitemap should list only URLs that return 200.",
+    "seo.orphan_pages": "Link to these pages from relevant navigation or related content so they can be "
+                        "reached and receive internal link equity.",
+    "seo.broken_internal_links": "Fix or remove the links pointing at these URLs, and restore or redirect "
+                                 "the targets that should exist.",
+    "seo.internal_redirects": "Update internal links to point at the final URL so each click costs no "
+                              "extra round trip.",
+    "seo.deep_pages": "Shorten the path to these pages with hub pages or navigation links if they matter; "
+                      "depth is fine for genuinely peripheral content.",
+    "seo.no_compression": "Enable gzip or brotli for HTML at the server or CDN.",
+    "seo.slow_pages": "Profile the slow responses server-side (queries, template rendering, upstream "
+                      "calls) and add caching where the content allows it.",
+    "seo.heavy_html": "Reduce the markup: remove inlined data payloads, paginate long listings and move "
+                      "repeated content out of the document.",
+    "seo.legacy_http_version": "Enable HTTP/2 (and HTTP/3 where available) at the server or CDN.",
+    "seo.coverage_single_page": "Re-run with --crawl (and --max-pages) to audit the site rather than one "
+                                "page; the site-wide checks need more than one page to compare.",
+    "seo.coverage_truncated": "Raise --max-pages and --depth until the crawl stops hitting its limit "
+                              "before treating any site-wide count as complete.",
     "og.missing": "Add Open Graph tags (og:title, og:type, og:image, og:url) so shared links render a controlled preview.",
     "og.incomplete": "Add the missing core Open Graph properties (og:title, og:type, og:image, og:url).",
     "og.malformed": "Use absolute http(s) URLs for og:image and og:url.",
@@ -122,6 +192,42 @@ RECOMMENDATIONS: dict[str, str] = {
     "tls.incomplete_chain": "Configure the server to send the full certificate chain (leaf plus intermediates), not just the leaf.",
     "tls.no_sct": "Use a publicly-trusted CA that embeds SCTs so the certificate is Certificate-Transparency logged.",
     "http.hsts_not_preload_ready": "Set Strict-Transport-Security with max-age≥31536000, includeSubDomains and preload, then submit the domain to the HSTS preload list.",
+    # passive discovery (subdomain sources and permutation)
+    "subdomains.discovery_incomplete": "Re-run the affected source(s) before treating the hostname list as "
+                                       "complete; a failed or skipped source means coverage is narrower than "
+                                       "it looks, not that no further names exist.",
+    "subdomains.unlisted_host": "Confirm each generated name that resolves is an inventoried, intended host; "
+                                "a resolving name absent from every public dataset is often forgotten "
+                                "infrastructure (staging, admin or legacy) that nobody is patching.",
+    # historical URLs
+    "historical.archived_urls": "Review the archived endpoint and parameter surface for routes that should no "
+                                "longer be reachable, and confirm anything still live is intended to be.",
+    "historical.sensitive_path": "Verify whether each archived sensitive path is still reachable; if a "
+                                 "backup, config or secret file was ever public, treat it as exposed and "
+                                 "rotate the affected credentials.",
+    "historical.credential_in_url": "Stop passing secrets in query strings (use headers or a POST body), and "
+                                    "rotate any credential that was ever carried in a URL — those values sit "
+                                    "in archives, proxy logs, browser history and Referer headers.",
+    "historical.parameter_surface": "Treat archived redirect- and file-valued parameters as an injection "
+                                    "surface: validate redirect targets against an allow-list and never map a "
+                                    "request parameter onto a filesystem path.",
+    "historical.legacy_technology": "Confirm whether the legacy stack is still deployed; if it is not, make "
+                                    "sure its old routes return 404/410 rather than an unmaintained handler, "
+                                    "and if it is, patch it like any other production component.",
+    "historical.discovery_incomplete": "Re-run the affected archive source(s) before treating the historical "
+                                       "URL surface as complete.",
+    # managed cloud inventory
+    "cloud.inventory": "Confirm every listed cloud resource is intended, owned by your organization and "
+                       "covered by your monitoring and access reviews.",
+    "cloud.object_storage_referenced": "Verify each bucket's access policy: block public listing, serve only "
+                                       "the objects meant to be public (ideally through a CDN with signed "
+                                       "URLs), and confirm no credential grants wider access than intended.",
+    "cloud.serverless_endpoint": "Require authentication and authorization on every function endpoint that "
+                                 "is not deliberately public, add per-caller rate limits, and confirm the "
+                                 "function cannot be driven into a state-changing action anonymously.",
+    "cloud.backend_endpoint": "Enforce authorization server-side (row-level security, database/storage rules, "
+                              "or role permissions) rather than relying on the public client key staying "
+                              "secret, and expose only the tables/collections intended to be readable.",
 }
 
 LIMITATIONS: dict[str, str] = {
@@ -140,7 +246,34 @@ LIMITATIONS: dict[str, str] = {
     "html.third_party_script_no_sri": "Presence of the attribute is checked for every referenced script; hash verification is performed only for assets the scan downloaded (in-scope plus --asset-host).",
     "js.exposed_secret": "Heuristic pattern match on downloaded in-scope bundles; raw values are not stored, so each must be confirmed manually. False positives are possible.",
     "js.client_config": "Public client configuration is not a vulnerability by itself.",
-    "seo.": "Observed on the fetched landing page only; other pages and server-rendered variants may differ.",
+    # The four landing-page checks predate the SEO module and still look at exactly one page.
+    "seo.title_missing": "Observed on the fetched landing page only; other pages may differ.",
+    "seo.meta_description_missing": "Observed on the fetched landing page only; other pages may differ.",
+    "seo.noindex": "Observed on the fetched landing page only; other pages may differ.",
+    "seo.canonical_offsite": "Observed on the fetched landing page only; other pages may differ.",
+    "seo.": "Derived from the pages this scan already fetched — one page without --crawl — and from the "
+            "markup as served, so content or metadata added by JavaScript is included only when --render "
+            "ran. Indexability is what the site declares (robots meta, X-Robots-Tag, robots.txt, "
+            "canonical), never what a search engine has actually indexed, and no part of this audit "
+            "measures rankings, traffic or real-user performance.",
+    "seo.thin_content": "Words are counted in the served HTML; copy rendered by JavaScript is not counted "
+                        "unless --render ran, so a client-rendered page can look thin while reading fine.",
+    "seo.orphan_pages": "Inbound links are counted only among the analyzed pages. A page linked solely "
+                        "from a page this crawl did not fetch is indistinguishable from a real orphan.",
+    "seo.sitemap_coverage_gap": "Compares the sitemap against the crawled pages only, so it reports pages "
+                                "missing from the sitemap, not sitemap URLs missing from the site.",
+    "seo.broken_internal_links": "Covers only the in-scope URLs this crawl followed; external links and "
+                                 "unfetched paths were not checked.",
+    "seo.internal_redirects": "Covers only the in-scope URLs this crawl followed.",
+    "seo.slow_pages": "A single server-response timing per page from this scan — not a user-perceived "
+                      "metric, not Core Web Vitals, and sensitive to cache state and network conditions.",
+    "seo.heavy_html": "Document markup only; images, scripts and stylesheets are not included in the size.",
+    "seo.no_compression": "Observed on the landing-page response; another path, origin or edge node could "
+                          "answer differently.",
+    "seo.legacy_http_version": "The version negotiated for the landing-page request by this client; a "
+                               "different client or path may negotiate another version.",
+    "seo.coverage_single_page": "States the audit's own coverage; it is not a finding about the site.",
+    "seo.coverage_truncated": "States the audit's own coverage; it is not a finding about the site.",
     "og.": "Observed on the fetched landing page only; social previews also depend on each platform's own crawler.",
     "twitter.": "Observed on the fetched landing page only; the preview also depends on X/Twitter's own crawler.",
     "trackers.": "Classified from referenced third-party domains against a versioned signature set; coverage is not exhaustive and a tracker loaded only after consent or user action may not appear.",
@@ -156,16 +289,35 @@ LIMITATIONS: dict[str, str] = {
     "dns.caa_ct_mismatch": "Issuer matching is heuristic and CT data can include historical certificates issued before the current CAA policy; treat as a lead, not proof.",
     "tls.no_sct": "Only SCTs embedded in the certificate are checked; SCTs delivered via the TLS handshake or OCSP stapling are not inspected.",
     "http.hsts_not_preload_ready": "Checks the header's preload eligibility from its directives, not actual membership in the browser preload list.",
+    "subdomains.discovery_incomplete": "Lists which sources failed or were skipped; it cannot say how many "
+                                       "names were missed.",
+    "subdomains.unlisted_host": "The name was generated locally from observed labels and kept only because it "
+                                "resolves in DNS. Resolution proves the record exists, not that a service "
+                                "runs there; nothing was fetched from these hosts.",
+    "historical.": "Retrieved from third-party web archives and URL indexes. It reflects what those archives "
+                   "crawled in the past — not a live observation by SiteRecon — so a path here may be gone, "
+                   "and absence here never proves a path never existed. Query values are redacted.",
+    "historical.legacy_technology": "Inferred from archived URL paths and file extensions, which describe the "
+                                    "stack that served those paths at the time. It is not a statement about "
+                                    "the current stack; the technology module covers that.",
+    "historical.credential_in_url": "Based on the parameter NAME only — the values are redacted and never "
+                                    "stored, so whether a real secret was carried must be confirmed from your "
+                                    "own logs.",
+    "cloud.": "Derived from references in collected evidence (pages, bundles, CSP, CNAMEs). SiteRecon never "
+              "requests these resources, so it cannot establish whether a bucket is listable, an endpoint "
+              "answers, or the resource even still exists — only that the application points at it. "
+              "Confirming exposure requires an authorized active check.",
 }
 
 _CATEGORY_MODULES: dict[str, tuple[str, ...]] = {
     "dns": ("dns",), "email": ("dns",), "dnssec": ("dnssec", "whois"), "http": ("http", "crawler"),
     "tls": ("tls",), "registration": ("whois",), "html": ("html", "crawler"), "crawl": ("crawler",),
     "cookies": ("cookies",), "resources": ("resources",), "subdomains": ("subdomains",),
-    "javascript": ("javascript",), "seo": ("html",), "social": ("html",),
+    "javascript": ("javascript",), "seo": ("seo", "html", "crawler", "resources"),
+    "social": ("html", "seo"),
     "trackers": ("third_party", "javascript", "html"), "waf": ("http", "cookies"),
     "hosting": ("network",), "intel": ("wayback", "shodan_internetdb"), "render": ("render",),
-    "vuln": ("vulnscan",),
+    "vuln": ("vulnscan",), "historical": ("historical",), "cloud": ("third_party", "javascript"),
 }
 
 

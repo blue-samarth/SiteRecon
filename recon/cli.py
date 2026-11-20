@@ -32,6 +32,8 @@ from recon.active.inventory import Inventory, build_inventory, read_inventory, w
 from recon.analysis import ScanComparator
 from recon.config import ALL_MODULES, Config, OutputFormat
 from recon.models import ChangeKind, ComparisonResult, ModuleStatus, ReconReport, Severity
+from recon.modules import historical as historical_sources
+from recon.modules import subdomain_sources as passive_sources
 from recon.orchestrator import ScanHistory, ScanOrchestrator
 from recon.reporting import (
     ActiveHtmlReportWriter,
@@ -102,9 +104,39 @@ def scan(
     subdomains: Annotated[bool, typer.Option("--subdomains/--no-subdomains", help="CT subdomain discovery.")] = True,
     probe_subdomains: Annotated[bool, typer.Option(
         "--probe-subdomains", help="Also check HTTPS and TLS on each discovered subdomain that resolves.")] = False,
-    max_subdomains: Annotated[int, typer.Option(min=0, max=1000, help="Max CT names to verify.")] = 100,
+    max_subdomains: Annotated[int, typer.Option(min=0, max=1000, help="Max discovered names to verify.")] = 100,
+    subdomain_source: Annotated[list[str] | None, typer.Option(
+        "--subdomain-source",
+        help="Additional passive subdomain source (repeatable). 'all' enables every source, 'keyless' every "
+             f"source needing no API key. Choices: {', '.join(passive_sources.ALL_SOURCES)}. Default: "
+             "Certificate Transparency only — each source discloses the target domain to that provider.")] = None,
+    permute_subdomains: Annotated[bool, typer.Option(
+        "--permute-subdomains",
+        help="Generate candidate hostnames from the discovered names and keep the ones that resolve "
+             "(DNS lookups only, hard-capped, nothing is fetched).")] = False,
+    max_permutations: Annotated[int, typer.Option(
+        min=0, max=2000, help="Cap on generated candidates resolved with --permute-subdomains.")] = 200,
+    historical: Annotated[bool, typer.Option(
+        "--historical",
+        help="Collect archived URLs from web archives and URL indexes (Wayback, Common Crawl, urlscan.io, "
+             "OTX) and extract the historical endpoint, parameter and legacy-technology surface. Discloses "
+             "the target domain to those providers.")] = False,
+    historical_source: Annotated[list[str] | None, typer.Option(
+        "--historical-source",
+        help=f"Restrict --historical to these sources (repeatable). Choices: {', '.join(historical_sources.ALL_SOURCES)}.")] = None,
+    max_historical_urls: Annotated[int, typer.Option(
+        min=1, max=20000, help="Per-source cap on archived URLs requested with --historical.")] = 1000,
+    seo: Annotated[bool, typer.Option(
+        "--seo",
+        help="Run the on-page SEO audit over the pages this scan fetches: indexability, titles and "
+             "metadata, headings and content, internal links, sitemap coverage and delivery, scored A-F "
+             "per area. Sends no extra requests of its own, but turns the crawler on (use --no-crawl to "
+             "audit the landing page alone).")] = False,
     whois: Annotated[bool, typer.Option("--whois/--no-whois", help="Domain registration lookup.")] = True,
-    crawl: Annotated[bool, typer.Option("--crawl", help="Crawl in-scope pages linked from the site.")] = False,
+    crawl: Annotated[bool | None, typer.Option(
+        "--crawl/--no-crawl",
+        help="Crawl in-scope pages linked from the site. Off by default, except with --seo, which needs "
+             "more than one page to audit a site.")] = None,
     depth: Annotated[int, typer.Option(min=0, max=5, help="Crawl depth from the start page.")] = 1,
     max_pages: Annotated[int, typer.Option(min=1, max=500, help="Maximum pages to crawl.")] = 25,
     crawl_delay: Annotated[float, typer.Option(min=0, max=10, help="Delay between crawl requests (s).")] = 0.25,
@@ -147,8 +179,15 @@ def scan(
         subdomains (bool): Run Certificate Transparency subdomain discovery.
         probe_subdomains (bool): Check HTTPS and TLS on discovered names that resolve publicly.
         max_subdomains (int): Maximum discovered names to verify.
+        subdomain_source (list[str] | None): Additional passive subdomain sources to query.
+        permute_subdomains (bool): Generate candidate names and keep those that resolve in DNS.
+        max_permutations (int): Cap on generated candidates resolved.
+        historical (bool): Collect archived URLs from web archives and URL indexes.
+        historical_source (list[str] | None): Restrict the historical sources queried.
+        max_historical_urls (int): Per-source cap on archived URLs requested.
+        seo (bool): Run the on-page SEO audit (implies --crawl unless --no-crawl is given).
         whois (bool): Run the domain registration lookup.
-        crawl (bool): Crawl in-scope pages.
+        crawl (bool | None): Crawl in-scope pages; None means "off unless --seo asks for it".
         depth (int): Crawl depth.
         max_pages (int): Maximum pages to crawl.
         crawl_delay (float): Delay between crawl requests in seconds.
@@ -173,15 +212,41 @@ def scan(
     except InvalidTargetError as exc:
         console.print(f"[red]Invalid --asset-host:[/red] {exc}")
         raise typer.Exit(2) from exc
+    # Reject an unknown source name instead of quietly running fewer sources than was asked for.
+    if unknown := passive_sources.unknown_sources(subdomain_source):
+        console.print(f"[red]Unknown --subdomain-source:[/red] {', '.join(unknown)}. "
+                      f"Choices: {', '.join(passive_sources.ALL_SOURCES)}, all, keyless, none.")
+        raise typer.Exit(2)
+    if unknown := historical_sources.unknown_sources(historical_source):
+        console.print(f"[red]Unknown --historical-source:[/red] {', '.join(unknown)}. "
+                      f"Choices: {', '.join(historical_sources.ALL_SOURCES)}, all, none.")
+        raise typer.Exit(2)
+
+    # --seo audits a *site*, and every site-wide check (duplicate titles, internal links, orphan pages,
+    # sitemap coverage) needs more than one page to compare. So --seo turns the crawler on rather than
+    # quietly producing a one-page audit — and says so, because that is extra requests to the target.
+    # An explicit --crawl/--no-crawl always wins.
+    crawl_enabled = seo if crawl is None else crawl
+    if seo and crawl is None and "crawler" in selected:
+        console.print("[dim]--seo: crawling in-scope pages (up to "
+                      f"{max_pages} at depth {depth}) so the site-wide checks have pages to compare; "
+                      "pass --no-crawl to audit the landing page alone.[/dim]")
+    elif seo and not (crawl_enabled and "crawler" in selected):
+        console.print("[dim]--seo with --no-crawl: auditing the landing page only; every site-wide check "
+                      "will be reported as not evaluated.[/dim]")
 
     config = Config(
         target_input=domain, hostname=hostname, output_dir=output, output_format=output_format,
         timeout=timeout, retries=retries, concurrency=concurrency, subdomains=subdomains, verbose=verbose,
         allow_private_networks=allow_private_networks, probe_subdomains=probe_subdomains,
-        max_subdomains=max_subdomains, whois=whois, modules=selected, crawl=crawl, crawl_depth=depth,
-        max_pages=max_pages, crawl_delay=crawl_delay, respect_robots=not ignore_robots, history=history,
+        max_subdomains=max_subdomains, whois=whois, modules=selected, crawl=crawl_enabled,
+        crawl_depth=depth, seo=seo, max_pages=max_pages, crawl_delay=crawl_delay,
+        respect_robots=not ignore_robots, history=history,
         max_assets=max_assets, asset_hosts=asset_hosts, geoip_db=geoip_db,
         render=render, render_timeout=render_timeout, check_vulns=check_vulns,
+        subdomain_sources=tuple(subdomain_source or ()), permute_subdomains=permute_subdomains,
+        max_permutations=max_permutations, historical=historical,
+        historical_sources=tuple(historical_source or ()), max_historical_urls=max_historical_urls,
     )
     console.print(f"[bold]Scanning[/bold] {hostname} [dim](passive; authorized targets only)[/dim]")
     with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
@@ -442,9 +507,10 @@ def active_cmd(
     orchestrator = ActiveOrchestrator(auth, now=moment)
     if dry_run:
         if bypass_sec:
-            console.print(f"[bold red]--bypass-sec[/bold red] [dim]— a passive scan will discover targets under "
-                          f"{registrable_domain(hostname) or hostname} and run the complete check set (except "
-                          "email).[/dim]")
+            console.print(f"[bold red]--bypass-sec[/bold red] [dim]— a passive scan (every discovery source, "
+                          "DNS-confirmed generated names, archived URLs) will discover targets under "
+                          f"{registrable_domain(hostname) or hostname}, then the complete check set (except "
+                          "email) runs against them.[/dim]")
         _print_active_plan(orchestrator, auth, moment)
         return
     try:
@@ -460,16 +526,32 @@ def active_cmd(
                       f"the passive scan discovers under [bold]{registrable_domain(hostname) or hostname}[/bold] "
                       "and the backends the site embeds. [dim]You own the SLAs; run with sudo for full network "
                       "probing (traceroute).[/dim]")
+        console.print("  [dim]Passive discovery runs wide too: every subdomain source, generated names "
+                      "confirmed in DNS, and archived URLs — which discloses this domain to those "
+                      "providers.[/dim]")
 
     active_dir = output / hostname / "active"
     inventory: Inventory | None = None
     if passive:
         console.print("\n[bold]Step 1 — passive recon[/bold] [dim](building inventory)[/dim]")
+        # --bypass-sec means "this is mine, find everything": it turns on every opt-in passive capability
+        # and widens their caps. The passive opt-ins are off by default only because each discloses the
+        # target to a third party (archives, passive-DNS datasets, osv.dev) — a cost the operator of a
+        # local run on their own property has already accepted by passing this flag.
         pconfig = Config(target_input=domain, hostname=hostname, output_dir=output, output_format=output_format,
                          crawl=True, history=False, verbose=verbose, retain_client_keys=bypass_sec,
                          render=bypass_sec, probe_subdomains=bypass_sec, check_vulns=bypass_sec,
                          crawl_depth=10 if bypass_sec else 1,       # --bypass-sec crawls deep…
-                         max_pages=100 if bypass_sec else 25)       # …and wide, so the deep crawl has pages to find
+                         max_pages=100 if bypass_sec else 25,       # …and wide, so the deep crawl has pages to find
+                         # every passive discovery source (keyed ones skip themselves if unconfigured),
+                         # generated names confirmed in DNS, and the archived URL surface
+                         subdomain_sources=("all",) if bypass_sec else (),
+                         permute_subdomains=bypass_sec,
+                         max_permutations=1000 if bypass_sec else 200,
+                         historical=bypass_sec,
+                         max_historical_urls=5000 if bypass_sec else 1000,
+                         # more sources and generated names than the default cap would verify
+                         max_subdomains=500 if bypass_sec else 100)
         with _progress_bar("Passive recon", ScanOrchestrator.MODULE_COUNT) as (advance, _set):
             passive_report = asyncio.run(ScanOrchestrator(pconfig).run(progress=advance))
         p_writers: list[ReportWriter] = [JsonReportWriter(passive_report)]
@@ -697,6 +779,7 @@ class TerminalSummary:
         self._modules(report)
         self._infrastructure(report)
         self._technologies(report)
+        self._seo(report)
         self._counts(report)
         self._findings(report)
         if report.comparison:
@@ -747,6 +830,37 @@ class TerminalSummary:
         for item in tech.technologies:
             table.add_row(item.name, item.category, item.version or "", item.status.value)
         self.console.print(table)
+
+    def _seo(self, report: ReconReport) -> None:
+        '''
+        Print the SEO grade, its per-area breakdown and the checks that failed.
+
+        Checks that could not be evaluated are counted separately and never shown as passes, so a
+        one-page audit does not read as a clean one.
+        Parameters:
+            report (ReconReport): The completed reconnaissance report.
+        '''
+        seo = report.analysis.seo
+        if seo is None:
+            return
+        table = Table(title=f"SEO grade {seo.grade} ({seo.score}/100 — {seo.pages_analyzed} page(s) "
+                            "analyzed; separate from the security grade)", title_justify="left")
+        for col in ("Area", "Grade", "Score", "Failing checks", "Deducted"):
+            table.add_column(col)
+        for area in seo.areas:
+            style = "green" if area.score >= 85 else "yellow" if area.score >= 60 else "red"
+            table.add_row(area.label, f"[{style}]{area.grade}[/{style}]", str(area.score),
+                          str(area.findings), str(area.penalty))
+        self.console.print(table)
+        failing = sorted((c for c in seo.checks if c.status == "fail"), key=lambda c: -c.penalty)
+        skipped = sum(1 for c in seo.checks if c.status == "not_checked")
+        if failing:
+            worst = ", ".join(f"{c.label} ({c.affected}/{c.checked})" for c in failing[:6])
+            self.console.print(f"[bold]SEO issues:[/bold] {len(failing)} of {len(seo.checks)} checks "
+                               f"failed — {worst}" + (", …" if len(failing) > 6 else ""))
+        if skipped:
+            self.console.print(f"[dim]SEO: {skipped} check(s) had no evidence to evaluate "
+                               "(not passes) — see the report.[/dim]")
 
     def _counts(self, report: ReconReport) -> None:
         '''
