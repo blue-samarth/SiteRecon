@@ -54,21 +54,75 @@ def test_depth_findings_quiet_on_strong_posture():
 
 # ------------------------------------------------------------------ HSTS preload eligibility
 
-def _http(hsts):
+READY = "max-age=63072000; includeSubDomains; preload"
+
+
+def _http(hsts, preload=None):
     sh = {"strict-transport-security": SecurityHeader(name="strict-transport-security", present=True, value=hsts)}
     return HttpData(probes=[HttpProbe(requested_url="https://example.com/", success=True, final_fetched=True,
-                                      final_url="https://example.com/", status_code=200, security_headers=sh)])
+                                      final_url="https://example.com/", status_code=200, security_headers=sh)],
+                    hsts_preload=preload)
 
 
-def _hsts_codes(hsts):
+def _hsts_codes(hsts, preload=None):
     f = FindingCollector(T0)
-    AnalysisEngine._analyze_hsts_preload(_http(hsts), f)
+    AnalysisEngine._analyze_hsts_preload(_http(hsts, preload), "example.com", f)
     return {x.id.split(":", 1)[0] for x in f.sorted()}
 
 
+def _listed(preloaded=True, **over):
+    from recon.models import HstsPreload
+    return HstsPreload(checked=True, preloaded=preloaded, hostname="example.com",
+                       matched_name="example.com" if preloaded else None,
+                       snapshot_date="2026-11-20", entries=95_544, **over)
+
+
 def test_hsts_preload_ready_is_quiet():
-    assert _hsts_codes("max-age=63072000; includeSubDomains; preload") == set()
+    assert _hsts_codes(READY) == set()
 
 
 def test_hsts_not_preload_ready_is_flagged():
     assert "http.hsts_not_preload_ready" in _hsts_codes("max-age=600")
+
+
+# ---- membership and eligibility are two facts, and the pairing is what carries the information
+
+def test_ready_header_on_a_listed_domain_is_quiet():
+    assert _hsts_codes(READY, _listed()) == set()
+
+
+def test_ready_header_on_an_unlisted_domain_says_it_was_never_submitted():
+    codes = _hsts_codes(READY, _listed(preloaded=False))
+    assert codes == {"http.hsts_preload_eligible_not_listed"}
+
+
+def test_a_listed_domain_whose_header_no_longer_qualifies_is_its_own_finding():
+    codes = _hsts_codes("max-age=600", _listed())
+    assert codes == {"http.hsts_preloaded_header_ineligible"}
+    assert "http.hsts_not_preload_ready" not in codes      # not both; the listed case supersedes it
+
+
+def test_the_ineligible_listed_finding_names_what_is_missing_and_the_snapshot():
+    f = FindingCollector(T0)
+    AnalysisEngine._analyze_hsts_preload(_http("max-age=600", _listed()), "example.com", f)
+    evidence = " ".join(f.sorted()[0].evidence)
+    assert "includeSubDomains" in evidence and "preload" in evidence and "max-age" in evidence
+    assert "2026-11-20" in evidence and "95,544" in evidence
+    assert f.sorted()[0].severity.value == "low"           # protection is real; the drift is what matters
+
+
+def test_an_ancestor_entry_is_reported_as_covering_the_host():
+    from recon.models import HstsPreload
+    covered = HstsPreload(checked=True, preloaded=True, hostname="shop.example.com",
+                          matched_name="example.com", via_subdomains=True, snapshot_date="2026-11-20",
+                          entries=95_544)
+    f = FindingCollector(T0)
+    AnalysisEngine._analyze_hsts_preload(_http("max-age=600", covered), "shop.example.com", f)
+    assert "covered by the preload entry for 'example.com'" in " ".join(f.sorted()[0].evidence)
+
+
+def test_without_a_snapshot_nothing_is_claimed_about_membership():
+    from recon.models import HstsPreload
+    unchecked = HstsPreload(checked=False, hostname="example.com", note="no snapshot bundled")
+    assert _hsts_codes(READY, unchecked) == set()                   # no "not listed" claim
+    assert _hsts_codes("max-age=600", unchecked) == {"http.hsts_not_preload_ready"}

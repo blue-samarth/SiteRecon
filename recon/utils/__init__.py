@@ -12,6 +12,7 @@ from recon.utils.domains import (
     public_suffix,
     registrable_domain,
 )
+from recon.utils.hsts import HstsPreloadList, PreloadStatus, preload_status
 from recon.utils.psl import PublicSuffixList
 from recon.utils.http_client import (
     REDIRECT_STATUSES,
@@ -32,6 +33,7 @@ from recon.utils.geoip import GeoLocator
 __all__ = [
     "host_of", "matches_suffix", "normalize_discovered", "registrable_domain", "public_suffix",
     "PublicSuffixList",
+    "HstsPreloadList", "PreloadStatus", "preload_status",
     "REDIRECT_STATUSES", "RETRY_STATUSES", "BlockedRequestError", "FetchOutcome", "RawResponse",
     "Resolve", "SafeHttpClient",
     "LOGGER_NAME", "get_logger", "setup_logging",

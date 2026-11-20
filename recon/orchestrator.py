@@ -307,8 +307,10 @@ class ScanOrchestrator:
             html_result = await self._maybe("html", lambda: HtmlCollector(host, http),
                                             None if http else "requires HTTP results")
             origin = self.origin(host, http)
+            mx_hosts = list(dns_result.data.email.transport.mx_hosts) if dns_result.data else []
             resources_result = await self._maybe(
-                "resources", lambda: ResourcesCollector(host, self.target_client, origin, html_result.data))
+                "resources", lambda: ResourcesCollector(host, self.target_client, origin, html_result.data,
+                                                        mx_hosts=mx_hosts))
             sitemap_urls = resources_result.data.sitemap_urls() if resources_result.data else []
             robots = resources_result.data.robots if resources_result.data else None
             crawler_result = await self._maybe("crawler", lambda: Crawler(

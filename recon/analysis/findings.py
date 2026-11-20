@@ -185,6 +185,23 @@ RECOMMENDATIONS: dict[str, str] = {
     "subdomain.dangling_cname": "Keep the backing resource provisioned, or remove the record if the delegated service is no longer used.",
     "vuln.known_component": "Upgrade the component to a release unaffected by the listed advisories; if upgrading is not possible, apply the vendor mitigation or remove the component.",
     "email.mta_sts_missing": "Publish an MTA-STS policy in enforce mode and the _mta-sts TXT record so sending servers require TLS for delivery.",
+    "email.mta_sts_policy_without_record": "Publish the _mta-sts TXT record (v=STSv1; id=<version>) so "
+                                           "senders discover the policy you are already serving.",
+    "email.mta_sts_policy_unreachable": "Serve the policy at https://mta-sts.<domain>/.well-known/"
+                                        "mta-sts.txt over HTTPS with a valid certificate and a text/plain "
+                                        "content type, or remove the _mta-sts record until it is available.",
+    "email.mta_sts_policy_invalid": "Correct the policy to RFC 8461: 'version: STSv1', a mode of enforce, "
+                                    "testing or none, a max_age between 1 and 31557600, and one 'mx:' line "
+                                    "per accepted mail host.",
+    "email.mta_sts_testing_mode": "Review the TLS-RPT reports, then move the policy to mode: enforce; "
+                                  "testing mode reports failures but still permits plaintext delivery.",
+    "email.mta_sts_withdrawn": "If MTA-STS is still intended, set mode back to enforce; if the domain no "
+                               "longer receives mail, remove the policy and the _mta-sts record together.",
+    "email.mta_sts_mx_mismatch": "Add an 'mx:' line for every MX host that accepts mail (a '*.' wildcard "
+                                 "covers one label), and keep the policy updated whenever MX records "
+                                 "change — under enforce, an uncovered MX loses mail.",
+    "email.mta_sts_short_max_age": "Raise max_age to at least 1209600 (two weeks) once the policy is "
+                                   "stable; keep it short only while rolling out.",
     "email.tls_rpt_missing": "Publish a TLS-RPT (_smtp._tls) record so you receive reports of mail TLS failures and downgrade attempts.",
     "email.dane_missing": "Publish TLSA records for the MX hosts (with DNSSEC) to protect SMTP delivery TLS, as an alternative or complement to MTA-STS.",
     "dns.caa_ct_mismatch": "Confirm the certificate is legitimate; if it predates the current CAA policy that is expected, otherwise investigate possible mis-issuance.",
@@ -192,6 +209,16 @@ RECOMMENDATIONS: dict[str, str] = {
     "tls.incomplete_chain": "Configure the server to send the full certificate chain (leaf plus intermediates), not just the leaf.",
     "tls.no_sct": "Use a publicly-trusted CA that embeds SCTs so the certificate is Certificate-Transparency logged.",
     "http.hsts_not_preload_ready": "Set Strict-Transport-Security with max-age≥31536000, includeSubDomains and preload, then submit the domain to the HSTS preload list.",
+    "http.hsts_preloaded_header_ineligible": "Restore a header that matches the listing "
+                                             "(max-age≥31536000, includeSubDomains, preload). The domain "
+                                             "stays protected either way, but a header that no longer "
+                                             "qualifies cannot be resubmitted and leaves anything not "
+                                             "using the browser list unprotected.",
+    "http.hsts_preload_eligible_not_listed": "Submit the domain at hstspreload.org if preloading is "
+                                             "intended; the preload directive by itself does nothing until "
+                                             "the submission is accepted. If it was submitted recently, "
+                                             "refresh the bundled list (scripts/refresh_hsts_preload.py) "
+                                             "and re-check.",
     # passive discovery (subdomain sources and permutation)
     "subdomains.discovery_incomplete": "Re-run the affected source(s) before treating the hostname list as "
                                        "complete; a failed or skipped source means coverage is narrower than "
@@ -285,10 +312,20 @@ LIMITATIONS: dict[str, str] = {
     "subdomain.takeover": "Heuristic from the CNAME target plus an unclaimed-resource fingerprint or a non-resolving target; confirm manually, as some providers require account-level verification before a resource can actually be claimed.",
     "subdomain.dangling_cname": "The CNAME points at a takeover-prone provider but the resource appears claimed right now; status can change if the backing resource is later released.",
     "vuln.known_component": "Matched by package name and version against OSV; a match means a published advisory affects that version, not that the vulnerable code path is used or reachable. Version detection is best-effort.",
-    "email.mta_sts_missing": "Detects the absence of the MTA-STS DNS record; the policy file itself (enforce vs testing mode) is not fetched.",
+    "email.mta_sts_missing": "Detects the absence of the _mta-sts DNS record. The policy file is fetched "
+                             "separately when the domain has MX records, so mode and MX coverage are "
+                             "reported under their own findings.",
+    "email.mta_sts_": "The policy is fetched from mta-sts.<domain> only when the domain publishes MX "
+                      "records, because no sender consults a policy otherwise. Mode and MX coverage are "
+                      "read from the policy as served at scan time; a sender holding a cached copy may "
+                      "still be acting on a previous version for up to its max_age.",
     "dns.caa_ct_mismatch": "Issuer matching is heuristic and CT data can include historical certificates issued before the current CAA policy; treat as a lead, not proof.",
     "tls.no_sct": "Only SCTs embedded in the certificate are checked; SCTs delivered via the TLS handshake or OCSP stapling are not inspected.",
-    "http.hsts_not_preload_ready": "Checks the header's preload eligibility from its directives, not actual membership in the browser preload list.",
+    "http.hsts_not_preload_ready": "Eligibility is read from the header's own directives. Membership in "
+                                   "the browser preload list is reported alongside it when a bundled "
+                                   "snapshot is available; without one, nothing is claimed about membership.",
+    "http.hsts_preloaded_header_ineligible": "Membership is answered from a bundled point-in-time copy of the Chromium preload list, not a live query, so a submission accepted after the snapshot was taken reads as absent. The snapshot's date is recorded in the evidence; refresh it with scripts/refresh_hsts_preload.py.",
+    "http.hsts_preload_eligible_not_listed": "Membership is answered from a bundled point-in-time copy of the Chromium preload list, not a live query, so a submission accepted after the snapshot was taken reads as absent. The snapshot's date is recorded in the evidence; refresh it with scripts/refresh_hsts_preload.py.",
     "subdomains.discovery_incomplete": "Lists which sources failed or were skipped; it cannot say how many "
                                        "names were missed.",
     "subdomains.unlisted_host": "The name was generated locally from observed labels and kept only because it "

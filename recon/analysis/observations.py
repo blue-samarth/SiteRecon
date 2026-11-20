@@ -210,6 +210,19 @@ class ObservationBuilder:
                     self._add(r, "http.security_header", p.final_url, name, sh.value, f"GET {p.final_url}")
                 self._add(r, "http.header", p.final_url, "cache-control", p.cache_control, f"GET {p.final_url}")
                 self._add(r, "http.header", p.final_url, "cors", p.cors, f"GET {p.final_url}")
+        pre = r.data.hsts_preload
+        if pre is not None and pre.checked:
+            # Recorded so the diff catches a domain leaving the preload list, which no header change
+            # would reveal. Stamped local_database: it is a lookup in a bundled snapshot, not a request.
+            self._add(r, "hsts.preload", pre.hostname or self.hostname, "listed", pre.preloaded,
+                      f"bundled HSTS preload snapshot of {pre.snapshot_date or 'unknown date'}",
+                      collection_method=CollectionMethod.LOCAL_DATABASE,
+                      limitations=["Point-in-time snapshot of the browser list, not a live query."])
+            if pre.preloaded and pre.matched_name:
+                self._add(r, "hsts.preload", pre.hostname or self.hostname, "entry",
+                          {"name": pre.matched_name, "covers_subdomains": pre.via_subdomains},
+                          f"bundled HSTS preload snapshot of {pre.snapshot_date or 'unknown date'}",
+                          collection_method=CollectionMethod.LOCAL_DATABASE)
 
     def _tls(self, r: ModuleResult) -> None:
         '''
@@ -276,6 +289,12 @@ class ObservationBuilder:
             if res is not None and res.error is None:
                 self._add(r, "resource", d.origin, name, {"present": res.present, "sha256": res.sha256 if res.present else None},
                           f"GET {res.url}")
+        if (mta := d.mta_sts) is not None and mta.not_applicable is None:
+            # mode is the fact that decides whether anything is enforced, so a silent enforce -> testing
+            # regression is exactly what the scan diff should catch.
+            self._add(r, "resource", d.origin, "mta_sts", {
+                "present": mta.present, "mode": mta.mode, "valid": mta.valid,
+                "max_age": mta.max_age, "mx": sorted(mta.mx)}, f"GET {mta.url}")
         for s in d.sitemaps:
             if s.error is None:
                 self._add(r, "resource", d.origin, f"sitemap:{s.url}", {"present": s.present, "url_count": s.url_count},

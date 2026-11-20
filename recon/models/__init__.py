@@ -45,12 +45,13 @@ from recon.models.historical import (
     HistoricalUrl,
 )
 from recon.models.html import HtmlData, ResourceRef
-from recon.models.http import HttpData, HttpHop, HttpProbe, SecurityHeader
+from recon.models.http import HstsPreload, HttpData, HttpHop, HttpProbe, SecurityHeader
 from recon.models.network import AsnInfo, GeoLocation, IpIntel, NetworkData, RdapNetwork
 from recon.models.observations import ChangeKind, Change, ComparisonResult, Observation, ScanRef
 from recon.models.resources import (
     FetchedResource,
     ManifestInfo,
+    MtaStsPolicy,
     ResourcesData,
     RobotsInfo,
     SecurityTxtInfo,
@@ -103,7 +104,7 @@ __all__ = [
     "DkimSelectorResult", "DmarcAnalysis", "DnsData", "DnsQueryResult", "DnsQueryStatus",
     "DnsRecord", "EmailSecurity", "EmailTransportSecurity", "SpfAnalysis", "SpfRecord",
     # html / http
-    "HtmlData", "ResourceRef", "HttpData", "HttpHop", "HttpProbe", "SecurityHeader",
+    "HtmlData", "ResourceRef", "HttpData", "HttpHop", "HttpProbe", "SecurityHeader", "HstsPreload",
     # network
     "AsnInfo", "GeoLocation", "IpIntel", "NetworkData", "RdapNetwork",
     # report / analysis output
@@ -116,7 +117,8 @@ __all__ = [
     # v0.2
     "CaaAnalysis", "CookieData", "CookieRecord", "CrawlData", "CrawledPage", "DiscoveredUrl", "FormRecord",
     "DnssecData", "DnssecStatus", "ChangeKind", "Change", "ComparisonResult", "Observation", "ScanRef",
-    "FetchedResource", "ManifestInfo", "ResourcesData", "RobotsInfo", "SecurityTxtInfo", "SitemapInfo",
+    "FetchedResource", "ManifestInfo", "MtaStsPolicy", "ResourcesData", "RobotsInfo", "SecurityTxtInfo",
+    "SitemapInfo",
     "TextResourceInfo", "CtEntry", "HostState", "ProviderResult",
     "AssetData", "AssetRecord", "LibraryHit", "SkippedAsset", "EndpointRef", "ClientConfig",
     "ClientConfigValue", "SecretFinding", "RenderData", "RenderRequest", "RenderedPage",

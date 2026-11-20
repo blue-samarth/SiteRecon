@@ -69,6 +69,25 @@ class ManifestInfo(FetchedResource):
     icon_count: int = 0
 
 
+class MtaStsPolicy(FetchedResource):
+    '''
+    The MTA-STS policy file (RFC 8461), fetched from mta-sts.<domain>/.well-known/mta-sts.txt.
+
+    The DNS TXT record only announces that a policy exists; the policy itself carries the part that
+    matters — whether TLS is actually *enforced*, which MX hosts it covers, and how long senders cache it.
+    A record without a reachable policy, or a policy in ``testing`` mode, both look like "MTA-STS is
+    configured" from DNS alone while enforcing nothing.
+    '''
+    mode: str | None = None                  # enforce, testing or none
+    version: str | None = None               # must be STSv1
+    max_age: int | None = None               # seconds senders may cache the policy
+    mx: list[str] = Field(default_factory=list)   # MX patterns the policy covers ('*.' wildcards allowed)
+    valid: bool = False                      # parsed and carries the required fields
+    parse_errors: list[str] = Field(default_factory=list)
+    served_over_https: bool | None = None    # RFC 8461 requires HTTPS with a valid certificate
+    not_applicable: str | None = None        # why the policy was not fetched (e.g. the domain has no MX)
+
+
 class TextResourceInfo(FetchedResource):
     '''
     A small free-text resource such as humans.txt.
@@ -87,6 +106,9 @@ class ResourcesData(BaseModel):
     manifest: ManifestInfo | None = None
     favicon: FetchedResource | None = None
     humans: TextResourceInfo | None = None
+    # Served from mta-sts.<domain>, not the target origin, but still a standard public resource of the
+    # domain; kept here so the policy sits beside the other well-known files rather than in its own module.
+    mta_sts: MtaStsPolicy | None = None
 
     def sitemap_urls(self) -> list[str]:
         '''

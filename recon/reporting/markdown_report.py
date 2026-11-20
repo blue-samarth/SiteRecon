@@ -235,6 +235,15 @@ class MarkdownReportWriter(ReportWriter):
                 ("Response time (ms)", p.response_time_ms),
                 ("Redirects to HTTPS", p.redirects_to_https),
             ])]
+            if pre := self.report.http.data.hsts_preload:
+                if pre.checked:
+                    covered = (f"yes — {'covered by ' + pre.matched_name if pre.via_subdomains else 'listed'}"
+                               if pre.preloaded else "no")
+                    out += [f"**HSTS preload list**: {covered} "
+                            f"(bundled snapshot of {pre.snapshot_date or 'unknown date'}, "
+                            f"{pre.entries:,} entries)", ""]
+                else:
+                    out += [f"**HSTS preload list**: not checked — {pre.note or 'no snapshot available'}.", ""]
             if p.security_headers:
                 out += ["**Security headers**", "",
                         self._table(["Header", "Present", "Value"],
@@ -521,7 +530,7 @@ class MarkdownReportWriter(ReportWriter):
 
     def _resources(self) -> str:
         '''
-        Render robots.txt, sitemaps, security.txt, manifest, favicon and humans.txt.
+        Render robots.txt, sitemaps, security.txt, manifest, favicon, humans.txt and the MTA-STS policy.
         Returns:
             str: Section body.
         '''
@@ -537,7 +546,9 @@ class MarkdownReportWriter(ReportWriter):
             return "soft 404" if res.soft_404 else (res.error or f"absent (HTTP {res.status_code})")
 
         items = [("robots.txt", d.robots), ("security.txt", d.security_txt), ("manifest", d.manifest),
-                 ("favicon", d.favicon), ("humans.txt", d.humans), *((f"sitemap ({s.source})", s) for s in d.sitemaps)]
+                 ("favicon", d.favicon), ("humans.txt", d.humans),
+                 *([("mta-sts.txt", d.mta_sts)] if d.mta_sts and d.mta_sts.not_applicable is None else []),
+                 *((f"sitemap ({s.source})", s) for s in d.sitemaps)]
         out = [self._table(["Resource", "URL", "State", "Type", "Size", "SHA-256"],
                            [(name, r.url, state(r), r.content_type, r.size, (r.sha256 or "")[:16] or None)
                             for name, r in items if r is not None])]
@@ -556,6 +567,16 @@ class MarkdownReportWriter(ReportWriter):
             out += ["**Web app manifest**", "", self._table(["Field", "Value"], [
                 ("Name", m.name), ("Short name", m.short_name), ("Start URL", m.start_url), ("Scope", m.scope),
                 ("Display", m.display), ("Theme color", m.theme_color), ("Icons", m.icon_count)])]
+        if (mta := d.mta_sts) is not None:
+            if mta.not_applicable:
+                out += [f"**MTA-STS policy**: not fetched — {mta.not_applicable}.", ""]
+            else:
+                out += ["**MTA-STS policy** (`" + mta.url + "`)", "", self._table(["Field", "Value"], [
+                    ("Fetched", "yes" if mta.present else state(mta)), ("Version", mta.version),
+                    ("Mode", mta.mode), ("Enforcing TLS", "yes" if mta.mode == "enforce" else "no"),
+                    ("max_age", mta.max_age), ("MX patterns", mta.mx),
+                    ("Valid per RFC 8461", "yes" if mta.valid else "no"),
+                    ("Parse errors", mta.parse_errors)])]
         urls = d.sitemap_urls()
         if urls:
             out += [f"**Sitemap URLs** ({len(urls)} in scope)", "", "\n".join(f"- `{u}`" for u in urls[:50]), ""]

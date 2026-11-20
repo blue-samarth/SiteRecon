@@ -20,6 +20,7 @@ from recon.models import (
     FetchedResource,
     HtmlData,
     ManifestInfo,
+    MtaStsPolicy,
     ResourcesData,
     RobotsInfo,
     SecurityTxtInfo,
@@ -142,6 +143,78 @@ class SitemapParser:
             info.urls = in_scope[: cls.MAX_URLS]
 
 
+class MtaStsParser:
+    '''
+    Parses an MTA-STS policy file (RFC 8461).
+
+    Parsing only: whether the policy's mx patterns actually cover the domain's MX records is a comparison
+    between two modules' evidence, so it lives in the analysis layer (``mta_sts_uncovered`` in
+    ``recon.analysis.engine``) rather than here.
+
+    The format is deliberately rigid — ``key: value`` lines, a fixed version string, a mode from a closed
+    set, a bounded max_age and one ``mx`` line per pattern — and senders reject a policy that breaks those
+    rules. So every deviation is recorded in ``parse_errors`` and ``valid`` stays False: a policy this
+    parser rejects is a policy real sending servers will ignore, which is a finding, not a parsing detail.
+    '''
+
+    MODES: ClassVar[frozenset[str]] = frozenset({"enforce", "testing", "none"})
+    MAX_AGE_LIMIT: ClassVar[int] = 31_557_600      # RFC 8461: max_age must not exceed one year
+    MAX_MX: ClassVar[int] = 100
+
+    @classmethod
+    def parse(cls, text: str, info: MtaStsPolicy) -> None:
+        '''
+        Fill an MtaStsPolicy from policy text.
+        Parameters:
+            text (str): Policy file body.
+            info (MtaStsPolicy): Object to update in place.
+        '''
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, value = line.partition(":")
+            key, value = key.strip().lower(), value.strip()
+            if not sep or not value:
+                if len(info.parse_errors) < 10:
+                    info.parse_errors.append(f"unparseable line: {line[:60]!r}")
+                continue
+            if key == "version":
+                info.version = value
+            elif key == "mode":
+                info.mode = value.lower()
+            elif key == "max_age":
+                try:
+                    info.max_age = int(value)
+                except ValueError:
+                    info.parse_errors.append(f"max_age is not an integer: {value[:20]!r}")
+            elif key == "mx" and len(info.mx) < cls.MAX_MX:
+                info.mx.append(value.lower().rstrip("."))
+        cls._validate(info)
+
+    @classmethod
+    def _validate(cls, info: MtaStsPolicy) -> None:
+        '''
+        Check the policy against the requirements senders enforce, setting ``valid`` accordingly.
+        Parameters:
+            info (MtaStsPolicy): Parsed policy to validate in place.
+        '''
+        if info.version != "STSv1":
+            info.parse_errors.append(f"version must be 'STSv1', got {info.version or 'nothing'!r}")
+        if info.mode is None:
+            info.parse_errors.append("no mode field")
+        elif info.mode not in cls.MODES:
+            info.parse_errors.append(f"mode must be enforce, testing or none, got {info.mode!r}")
+        if info.max_age is None:
+            info.parse_errors.append("no max_age field")
+        elif not 0 < info.max_age <= cls.MAX_AGE_LIMIT:
+            info.parse_errors.append(f"max_age must be between 1 and {cls.MAX_AGE_LIMIT}, got {info.max_age}")
+        # 'none' is the documented way to withdraw a policy, and withdrawal needs no mx list.
+        if not info.mx and info.mode != "none":
+            info.parse_errors.append("no mx patterns, so the policy covers no mail host")
+        info.valid = not info.parse_errors
+
+
 class ResourcesCollector(Collector[ResourcesData]):
     '''
     Fetches the standard public resources of the target origin.
@@ -152,7 +225,7 @@ class ResourcesCollector(Collector[ResourcesData]):
     MAX_DECOMPRESSED: ClassVar[int] = 10 * 1024 * 1024
 
     def __init__(self, hostname: str, client: SafeHttpClient, origin: str, html: HtmlData | None = None,
-                 now: datetime | None = None) -> None:
+                 now: datetime | None = None, mx_hosts: list[str] | None = None) -> None:
         '''
         Create the collector.
         Parameters:
@@ -161,12 +234,17 @@ class ResourcesCollector(Collector[ResourcesData]):
             origin (str): Origin to inspect, e.g. 'https://example.com'.
             html (HtmlData | None): Parsed landing page, used to find the declared manifest and favicon.
             now (datetime | None): Reference time for security.txt expiry; defaults to the current UTC time.
+            mx_hosts (list[str] | None): MX hostnames from DNS. The MTA-STS policy is fetched only when the
+                domain receives mail, and the hosts are kept so the analysis can tell whether the policy
+                actually covers them.
         '''
         self.scope = Scope.for_target(hostname)
+        self.hostname = hostname
         self.client = client
         self.origin = origin.rstrip("/")
         self.html = html
         self.now = now or datetime.now(UTC)
+        self.mx_hosts = mx_hosts or []
         self._errors: list[CollectionError] = []
 
     async def collect(self) -> tuple[ResourcesData, list[CollectionError]]:
@@ -176,8 +254,10 @@ class ResourcesCollector(Collector[ResourcesData]):
             tuple[ResourcesData, list[CollectionError]]: Resource observations and fetch errors.
         '''
         data = ResourcesData(origin=self.origin)
-        data.robots, data.security_txt, data.manifest, data.favicon, data.humans = await asyncio.gather(
-            self._robots(), self._security_txt(), self._manifest(), self._favicon(), self._humans())
+        (data.robots, data.security_txt, data.manifest, data.favicon, data.humans,
+         data.mta_sts) = await asyncio.gather(
+            self._robots(), self._security_txt(), self._manifest(), self._favicon(), self._humans(),
+            self._mta_sts())
         data.sitemaps = await self._sitemaps(data.robots)
         return data, self._errors
 
@@ -263,6 +343,31 @@ class ResourcesCollector(Collector[ResourcesData]):
             if text is not None:
                 SecurityTxtParser.parse(text, info, self.now)
                 break
+        return info
+
+    async def _mta_sts(self) -> MtaStsPolicy:
+        '''
+        Fetch and parse the MTA-STS policy from mta-sts.<domain>/.well-known/mta-sts.txt (RFC 8461).
+
+        Fetched only when DNS says the domain receives mail. Without MX records the policy is meaningless
+        — no sender will ever look for it — and requesting it would be a pointless lookup of a host that
+        usually does not exist; that case is recorded in ``not_applicable`` rather than as an absence.
+
+        The policy deliberately lives on its own host, so this is the one resource here that is not served
+        from the target origin. It is still inside the target's scope (a subdomain), so the same
+        scope-restricted client fetches it.
+        Returns:
+            MtaStsPolicy: Parsed policy (present=False when absent, not_applicable when not fetched).
+        '''
+        url = f"https://mta-sts.{self.hostname}/.well-known/mta-sts.txt"
+        info = MtaStsPolicy(url=url)
+        if not self.mx_hosts:
+            info.not_applicable = "the domain publishes no MX records, so no sender consults an MTA-STS policy"
+            return info
+        info.served_over_https = True          # the URL is https:// and the client validates TLS
+        text = self._text_present(await self._get(url, info), info)
+        if text is not None:
+            MtaStsParser.parse(text, info)
         return info
 
     async def _manifest(self) -> ManifestInfo:

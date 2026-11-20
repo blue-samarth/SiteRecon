@@ -51,6 +51,7 @@ from recon.models import (
     DnssecStatus,
     Observation,
     ResourcesData,
+    MtaStsPolicy,
     AssetData,
     SeoData,
     SeoCheck,
@@ -58,6 +59,10 @@ from recon.models import (
 )
 
 HSTS_RECOMMENDED_MAX_AGE: int = 15_552_000  # 180 days
+# RFC 8461 §6.4 recommends an MTA-STS max_age of at least two weeks; a policy cached for less than a day
+# leaves a wide window in which a sender has no policy at all and can be downgraded.
+MTA_STS_RECOMMENDED_MAX_AGE: int = 1_209_600   # 2 weeks
+MTA_STS_SHORT_MAX_AGE: int = 86_400            # 1 day
 TLS_EXPIRY_WARN_DAYS: int = 30
 TLS_EXPIRY_URGENT_DAYS: int = 14
 LEGACY_TLS: set[str] = {"TLSv1", "TLSv1.1", "SSLv3", "SSLv2"}
@@ -75,6 +80,42 @@ _CA_ISSUER_HINTS: dict[str, tuple[str, ...]] = {
     "zerossl.com": ("zerossl",), "entrust.net": ("entrust",), "actalis.it": ("actalis",),
     "godaddy.com": ("go daddy", "godaddy"), "microsoft.com": ("microsoft",),
 }
+
+
+def mta_sts_covers(pattern: str, host: str) -> bool:
+    '''
+    Whether an MTA-STS mx pattern covers an MX hostname.
+
+    A wildcard is only valid as the whole first label and matches exactly one label (RFC 8461 §4.1), so
+    '*.example.com' covers 'mx1.example.com' but neither 'example.com' nor 'a.mx1.example.com'.
+    Parameters:
+        pattern (str): An mx pattern from the policy.
+        host (str): An MX hostname from DNS.
+    Returns:
+        bool: True if the pattern covers the host.
+    '''
+    pattern, host = pattern.strip().lower().rstrip("."), host.strip().lower().rstrip(".")
+    if not pattern or not host:
+        return False
+    if pattern.startswith("*."):
+        label, _, rest = host.partition(".")
+        return bool(label) and rest == pattern[2:]
+    return pattern == host
+
+
+def mta_sts_uncovered(policy: MtaStsPolicy, mx_hosts: list[str]) -> list[str]:
+    '''
+    The MX hostnames from DNS that no pattern in the policy covers.
+
+    Under ``enforce`` these are the hosts senders will refuse to deliver to, so this is the comparison
+    that predicts a mail outage rather than merely describing configuration.
+    Parameters:
+        policy (MtaStsPolicy): Parsed policy.
+        mx_hosts (list[str]): MX hostnames from DNS.
+    Returns:
+        list[str]: Uncovered MX hostnames, in DNS order.
+    '''
+    return [h for h in mx_hosts if not any(mta_sts_covers(p, h) for p in policy.mx)]
 
 
 def _caa_issue_tags(records: list[str]) -> set[str]:
@@ -205,10 +246,10 @@ class AnalysisEngine:
         findings: FindingCollector = FindingCollector(self.timestamp)
         if dns:
             self._analyze_dns(dns, findings)
-            self._analyze_email_transport(dns, findings)
+            self._analyze_email_transport(dns, resources, findings)
             self._analyze_caa_ct_mismatch(dns, subdomains, tls, findings)
         if http: self._analyze_http(http, findings)
-        if http: self._analyze_hsts_preload(http, findings)
+        if http: self._analyze_hsts_preload(http, host, findings)
         if http: self._analyze_waf(http, cookies, findings)
         if tls: self._analyze_tls(tls, findings)
         if whois: self._analyze_whois(whois, findings)
@@ -244,25 +285,62 @@ class AnalysisEngine:
                               grade=compute_grade(ordered), seo=seo_grade)
 
     @staticmethod
-    def _analyze_email_transport(dns: DnsData, f: FindingCollector) -> None:
+    def _analyze_email_transport(dns: DnsData, resources: ResourcesData | None, f: FindingCollector) -> None:
         '''
         Report missing mail transport-security (MTA-STS, TLS-RPT, DANE) for domains that receive mail, and
         note BIMI when present. These apply only when the domain has MX records.
+
+        The MTA-STS record and the policy file it points at are judged together, because each is useless
+        without the other and the pairing names the actual fault: a record with no reachable policy
+        enforces nothing, and a policy nobody announces is never fetched. Only one of those is ever
+        reported, so the report says what is wrong rather than listing both halves.
         Parameters:
             dns (DnsData): DNS probe results (carries email.transport and MX).
+            resources (ResourcesData | None): Public resources, carrying the fetched MTA-STS policy.
             f (FindingCollector): Collector to add findings to.
         '''
         host = dns.hostname
         t = dns.email.transport
         if not t.mx_hosts:
             return   # no MX → the domain does not receive mail; transport-security does not apply
-        if not t.mta_sts_present:
+        policy = resources.mta_sts if resources else None
+        fetched = bool(policy and policy.present)
+        if not t.mta_sts_present and fetched:
+            # The policy file is deployed but nothing announces it, so no sender will ever fetch it. A
+            # sharper statement than "no MTA-STS" — the work is done bar one DNS record.
+            f.add("email.mta_sts_policy_without_record", host, category="email",
+                  title="MTA-STS policy is published but not announced in DNS",
+                  description="A valid-looking MTA-STS policy is served, but there is no _mta-sts TXT "
+                              "record, and senders discover policies only through that record. The policy "
+                              "is therefore never fetched and TLS is never required: the protection is "
+                              "one DNS record away from working.",
+                  severity=S.LOW, confidence=C.HIGH,
+                  evidence=[f"policy at {policy.url} (mode: {policy.mode or 'unparsed'})",
+                            f"no _mta-sts.{host} TXT record"],
+                  source=f"GET {policy.url} and DNS TXT _mta-sts")
+        elif not t.mta_sts_present:
             f.add("email.mta_sts_missing", host, category="email", title="No MTA-STS policy",
                   description="The domain receives mail but publishes no MTA-STS record, so sending servers "
                               "cannot require TLS for delivery and can be downgraded to plaintext by an "
                               "active network attacker.",
                   severity=S.LOW, confidence=C.HIGH, evidence=[f"no _mta-sts.{host} TXT; MX: {', '.join(t.mx_hosts[:5])}"],
                   source="DNS TXT _mta-sts")
+        elif policy is not None and not fetched:
+            f.add("email.mta_sts_policy_unreachable", host, category="email",
+                  title="MTA-STS record announces a policy that cannot be fetched",
+                  description="The _mta-sts TXT record tells senders a policy exists, but the policy file "
+                              "itself could not be retrieved. A sender that cannot fetch the policy falls "
+                              "back to unauthenticated delivery (or keeps serving a stale cached copy), so "
+                              "the record on its own enforces nothing.",
+                  severity=S.LOW, confidence=C.HIGH,
+                  evidence=[f"GET {policy.url}: "
+                            + (policy.error or f"HTTP {policy.status_code}" if policy.status_code
+                               else policy.error or "no response"),
+                            "soft 404 (an HTML page was served instead of the policy)" if policy.soft_404
+                            else f"_mta-sts.{host} TXT record is present"],
+                  source=f"GET {policy.url}")
+        if fetched and policy is not None:
+            AnalysisEngine._analyze_mta_sts_policy(policy, t.mx_hosts, host, f)
         if not t.tls_rpt_present:
             f.add("email.tls_rpt_missing", host, category="email", title="No SMTP TLS reporting (TLS-RPT)",
                   description="No TLS-RPT record, so the domain receives no reports of TLS delivery failures "
@@ -281,6 +359,81 @@ class AnalysisEngine:
                               "BIMI requires an enforced DMARC policy to take effect.",
                   severity=S.INFORMATIONAL, confidence=C.HIGH,
                   evidence=[f"default._bimi.{host}: l={t.bimi_location or '—'}"], source="DNS TXT default._bimi")
+
+    @staticmethod
+    def _analyze_mta_sts_policy(policy: MtaStsPolicy, mx_hosts: list[str], host: str,
+                                f: FindingCollector) -> None:
+        '''
+        Interpret a fetched MTA-STS policy: whether it enforces anything, and whether it covers the mail.
+
+        The DNS record alone cannot answer either question, which is why this exists. ``testing`` mode is
+        the common surprise — it is widely deployed and widely believed to be protection, while it only
+        produces reports. The MX coverage check is the one with operational teeth: under ``enforce``, a
+        sender refuses delivery to an MX the policy does not list, so an uncovered MX predicts lost mail
+        rather than merely weak configuration.
+        Parameters:
+            policy (MtaStsPolicy): The fetched, parsed policy.
+            mx_hosts (list[str]): MX hostnames from DNS.
+            host (str): Target hostname (finding subject).
+            f (FindingCollector): Collector to add findings to.
+        '''
+        source = f"GET {policy.url}"
+        if not policy.valid:
+            f.add("email.mta_sts_policy_invalid", host, category="email",
+                  title="MTA-STS policy is malformed",
+                  description="The policy does not satisfy RFC 8461, so sending servers will reject it and "
+                              "fall back to unauthenticated delivery. A malformed policy is equivalent to "
+                              "no policy, while still looking configured from DNS.",
+                  severity=S.LOW, confidence=C.HIGH,
+                  evidence=policy.parse_errors[:8] or ["policy could not be parsed"], source=source)
+            return      # mode and coverage below are meaningless once senders reject the file
+
+        if policy.mode == "testing":
+            f.add("email.mta_sts_testing_mode", host, category="email",
+                  title="MTA-STS policy is in testing mode, so nothing is enforced",
+                  description="The policy is published with mode=testing: senders report TLS failures but "
+                              "still deliver over plaintext when TLS or certificate validation fails. "
+                              "Testing mode is the correct place to start, and a common place to stop by "
+                              "accident — until the mode is enforce, MTA-STS prevents no downgrade.",
+                  severity=S.LOW, confidence=C.HIGH,
+                  evidence=["mode: testing", f"max_age: {policy.max_age}",
+                            f"mx: {', '.join(policy.mx[:5])}"], source=source)
+        elif policy.mode == "none":
+            f.add("email.mta_sts_withdrawn", host, category="email",
+                  title="MTA-STS policy is withdrawn (mode=none)",
+                  description="The policy declares mode=none, the documented way to withdraw MTA-STS. "
+                              "Senders holding a cached policy stop enforcing it. This is intentional "
+                              "during a decommission; confirm it was not left behind after one.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=["mode: none", f"max_age: {policy.max_age}"], source=source)
+
+        if uncovered := mta_sts_uncovered(policy, mx_hosts):
+            enforcing = policy.mode == "enforce"
+            f.add("email.mta_sts_mx_mismatch", host, category="email",
+                  title="MTA-STS policy does not cover every MX host",
+                  description=("Mail is accepted at MX hosts the policy does not list. Under mode=enforce a "
+                               "sending server refuses to deliver to a host absent from the policy, so these "
+                               "MX records will reject legitimate mail rather than fall back — this is a "
+                               "delivery failure, not a weakened defence."
+                               if enforcing else
+                               "Mail is accepted at MX hosts the policy does not list. In testing mode this "
+                               "only generates failure reports, but it would block delivery to these hosts "
+                               "the moment the policy moves to enforce."),
+                  severity=S.MEDIUM if enforcing else S.LOW, confidence=C.HIGH,
+                  evidence=[f"mode: {policy.mode}", f"policy mx: {', '.join(policy.mx[:8]) or 'none'}",
+                            f"uncovered MX: {', '.join(uncovered[:8])}"], source=source)
+
+        if policy.max_age is not None and policy.max_age < MTA_STS_SHORT_MAX_AGE:
+            f.add("email.mta_sts_short_max_age", host, category="email",
+                  title="MTA-STS policy is cached for less than a day",
+                  description=f"max_age is {policy.max_age} seconds. Senders re-fetch the policy that "
+                              "often, and a sender with no cached policy has no protection — so a short "
+                              "lifetime widens the window an active attacker can use, and makes the "
+                              "protection depend on the policy host staying reachable.",
+                  severity=S.INFORMATIONAL, confidence=C.HIGH,
+                  evidence=[f"max_age: {policy.max_age}",
+                            f"RFC 8461 recommends at least {MTA_STS_RECOMMENDED_MAX_AGE} (2 weeks)"],
+                  source=source)
 
     @staticmethod
     def _analyze_caa_ct_mismatch(dns: DnsData, subdomains: SubdomainData | None, tls: TlsData | None,
@@ -556,30 +709,79 @@ class AnalysisEngine:
                       evidence=[f"script-src/default-src: {' '.join(script_src)}"], source=source)
 
     @staticmethod
-    def _analyze_hsts_preload(http: HttpData, f: FindingCollector) -> None:
+    def _analyze_hsts_preload(http: HttpData, host: str | None, f: FindingCollector) -> None:
         '''
-        Report when HSTS is present but not eligible for the browser preload list (max-age < 1 year, or
-        missing includeSubDomains / preload). Silent when HSTS is absent — that is covered elsewhere.
+        Compare what the site's HSTS header asks for with whether the domain is actually preloaded.
+
+        These are two different facts and the pairing is what carries information. A preloaded domain is
+        upgraded by the browser whatever it sends today, so a header that no longer meets the criteria is
+        worth saying out loud — the protection is real but the site has stopped documenting it, and
+        removal from the list takes months to reach users. An eligible header on a domain that is not on
+        the list simply means nobody submitted it, which is the actionable case.
+
+        Membership comes from the bundled snapshot (see recon/utils/hsts.py). When no snapshot is
+        available nothing is claimed about membership at all; only the header's eligibility is reported.
+        Silent when HSTS is absent entirely — that is covered by http.hsts_missing.
         Parameters:
-            http (HttpData): HTTP probe results (security headers).
+            http (HttpData): HTTP probe results (security headers and the preload lookup).
+            host (str | None): Target hostname, the subject of the membership findings.
             f (FindingCollector): Collector to add findings to.
         '''
         for probe in http.probes:
             sh = probe.security_headers.get("strict-transport-security") if probe.security_headers else None
             if not (probe.final_fetched and sh and sh.value):
                 continue
+            url = probe.final_url or probe.requested_url
             value = sh.value.lower()
             max_age = re.search(r"max-age\s*=\s*(\d+)", value)
-            ready = (max_age is not None and int(max_age.group(1)) >= 31_536_000
-                     and "includesubdomains" in value and "preload" in value)
-            if not ready:
-                f.add("http.hsts_not_preload_ready", probe.final_url or probe.requested_url, category="http",
+            missing = [name for name, present in (("max-age ≥ 1 year",
+                                                   max_age is not None and int(max_age.group(1)) >= 31_536_000),
+                                                  ("includeSubDomains", "includesubdomains" in value),
+                                                  ("preload", "preload" in value)) if not present]
+            pre = http.hsts_preload
+            subject = host or url
+            listed = bool(pre and pre.checked and pre.preloaded)
+            coverage = (f"covered by the preload entry for '{pre.matched_name}'"
+                        if pre and pre.via_subdomains and pre.matched_name
+                        else f"listed as '{pre.matched_name}'" if pre and pre.matched_name else "listed")
+            snapshot = (f"bundled preload snapshot of {pre.snapshot_date} ({pre.entries:,} entries)"
+                        if pre and pre.snapshot_date else "bundled preload snapshot")
+
+            if missing and listed:
+                f.add("http.hsts_preloaded_header_ineligible", subject, category="http",
+                      title="Domain is HSTS-preloaded but its header no longer qualifies",
+                      description="The domain is in the browsers' HSTS preload list, so browsers upgrade "
+                                  "requests to it regardless of what it sends — but the header served today "
+                                  "would not meet the submission criteria. The protection is real and is not "
+                                  "at immediate risk, yet the site no longer declares it, a resubmission "
+                                  "would be rejected, and anything relying on the header alone (other agents, "
+                                  "a future list removal) is unprotected.",
+                      severity=S.LOW, confidence=C.HIGH,
+                      evidence=[f"header: {sh.value}", f"missing for eligibility: {', '.join(missing)}",
+                                f"{coverage} in the {snapshot}"],
+                      source=f"HSTS header on {url} compared with the bundled preload list")
+            elif missing:
+                f.add("http.hsts_not_preload_ready", url, category="http",
                       title="HSTS not eligible for preloading",
                       description="An HSTS header is set but does not meet the browser preload criteria "
                                   "(max-age ≥ 1 year, includeSubDomains, and the preload directive), so the "
                                   "domain cannot be added to the HSTS preload list.",
-                      severity=S.INFORMATIONAL, confidence=C.HIGH, evidence=[sh.value],
-                      source=f"HSTS header on {probe.final_url or probe.requested_url}")
+                      severity=S.INFORMATIONAL, confidence=C.HIGH,
+                      evidence=[sh.value, f"missing: {', '.join(missing)}"]
+                               + ([f"not present in the {snapshot}"] if pre and pre.checked else []),
+                      source=f"HSTS header on {url}")
+            elif pre and pre.checked and not pre.preloaded:
+                f.add("http.hsts_preload_eligible_not_listed", subject, category="http",
+                      title="HSTS header is preload-ready but the domain is not on the list",
+                      description="The header meets every preload criterion, including the preload "
+                                  "directive, which signals an intent to be preloaded — but the domain is "
+                                  "not in the bundled copy of the browser list. Either the submission was "
+                                  "never made, or it was made too recently to appear in this snapshot. "
+                                  "Until it is listed, the very first request to the domain is still "
+                                  "unprotected.",
+                      severity=S.INFORMATIONAL, confidence=C.MEDIUM,
+                      evidence=[f"header: {sh.value}", f"absent from the {snapshot}"],
+                      source=f"HSTS header on {url} compared with the bundled preload list")
             return   # one representative page is enough
 
     @staticmethod
