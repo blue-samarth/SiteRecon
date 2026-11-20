@@ -40,6 +40,13 @@ Both are keyless. The provider interface (`recon/intel/base.py`) carries a `requ
 `unavailable()` check, so key-gated providers (Google Safe Browsing, abuse.ch, Have I Been Pwned, full
 Shodan) can be added later as optional, disabled-without-a-key providers.
 
+> **Wayback appears in two places, deliberately.** The provider above asks the archive one question —
+> "how long has this domain been archived, and were sensitive-looking paths ever public?" — as part of an
+> authorized active engagement. The passive `historical` module (`scan --historical`) asks the archives for
+> the URLs themselves and mines them for the endpoint, parameter and legacy-technology surface; it also
+> covers Common Crawl, urlscan.io and OTX. They are independent: enabling both makes two requests to the
+> archive for different data. See [passive-discovery.md](passive-discovery.md).
+
 ## Audit and safety
 
 - **It runs only when authorized.** No `external_intelligence` in `checks_enabled` → no third-party

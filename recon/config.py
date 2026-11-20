@@ -17,7 +17,7 @@ DEFAULT_USER_AGENT: str = (
 # Every selectable module, in pipeline order.
 ALL_MODULES: tuple[str, ...] = (
     "dns", "dnssec", "network", "http", "tls", "whois", "resources", "crawler", "html", "javascript",
-    "technology", "cookies", "subdomains", "third_party", "render", "vulnscan",
+    "technology", "cookies", "subdomains", "third_party", "render", "vulnscan", "historical", "seo",
 )
 
 # Common public DKIM selectors (providers and defaults). DKIM selectors cannot be
@@ -59,8 +59,23 @@ class Config:
     # subdomains
     subdomains: bool = True
     probe_subdomains: bool = False      # HTTPS + TLS availability check of discovered names
-    max_subdomains: int = 100           # cap on verification of CT names
-    ct_cache_ttl_hours: float = 24.0    # reuse CT results this fresh when providers fail
+    max_subdomains: int = 100           # cap on verification of discovered names
+    ct_cache_ttl_hours: float = 24.0    # reuse CT/passive results this fresh when a source fails
+    # Non-CT passive discovery sources (OTX, urlscan, Common Crawl, Wayback, RapidDNS, HackerTarget,
+    # Anubis, BufferOver). Empty means Certificate Transparency only: each extra source discloses the
+    # target domain to another third party, so enabling them is the operator's explicit choice.
+    subdomain_sources: tuple[str, ...] = ()
+    # Controlled permutation: generate candidate names from the labels already discovered and keep only
+    # those that resolve in DNS. Opt-in and hard-capped; see SubdomainPermuter for why it stays small.
+    permute_subdomains: bool = False
+    max_permutations: int = 200
+    # historical URLs (web archives and URL indexes; discloses the target domain to those providers)
+    historical: bool = False
+    historical_sources: tuple[str, ...] = ()   # empty = every known source when the module is enabled
+    max_historical_urls: int = 1000            # per-source cap on URLs requested
+    # on-page SEO audit (derived from pages already fetched; sends no requests of its own, but a
+    # site-wide audit needs more than one page, so --seo turns the crawler on unless told otherwise)
+    seo: bool = False
     # registration
     whois: bool = True
     # crawling
@@ -101,7 +116,8 @@ class Config:
             bool: True if the module should run.
         '''
         flags = {"subdomains": self.subdomains, "whois": self.whois, "crawler": self.crawl,
-                 "render": self.render, "vulnscan": self.check_vulns}
+                 "render": self.render, "vulnscan": self.check_vulns, "historical": self.historical,
+                 "seo": self.seo}
         return module in self.modules and flags.get(module, True)
 
     @property

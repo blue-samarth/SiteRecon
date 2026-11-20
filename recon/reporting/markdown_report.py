@@ -56,12 +56,15 @@ class MarkdownReportWriter(ReportWriter):
             ("Technology Fingerprinting", self._technology()),
             ("HTML Analysis", self._html()),
             ("Website Crawl", self._crawl()),
+            ("SEO Audit", self._seo()),
             ("Dynamic Rendering", self._render()),
             ("JavaScript and CSS Assets", self._assets()),
             ("Known Vulnerabilities", self._vulns()),
             ("Cookies", self._cookies()),
             ("Subdomain Discovery", self._subdomains()),
+            ("Historical URLs", self._historical()),
             ("Third-Party Integrations", self._third_party()),
+            ("Managed Cloud Resources", self._cloud()),
             ("Infrastructure Providers", self._infrastructure()),
             ("Security Observations", self._findings()),
             ("Changes Since Previous Scan", self._changes()),
@@ -90,6 +93,11 @@ class MarkdownReportWriter(ReportWriter):
             lines += [f"**Security grade: {grade.grade}** ({grade.score}/100)", "",
                       self._table(["Area", "Grade", "Score", "Findings"],
                                   [(a.label, a.grade, a.score, a.findings) for a in grade.areas]), ""]
+        seo = self.report.analysis.seo
+        if seo is not None:
+            lines += [(f"**SEO grade: {seo.grade}** ({seo.score}/100 across {seo.pages_analyzed} "
+                       "page(s); scored separately from the security grade — see the SEO Audit section)"),
+                      ""]
         lines += [
             self._table(["Module", "Status", "Duration (ms)", "Errors"],
                    [(name, res.status.value, round(res.duration_ms), len(res.errors))
@@ -345,12 +353,28 @@ class MarkdownReportWriter(ReportWriter):
         if msg := self._unavailable(self.report.subdomains):
             return msg
         d = self.report.subdomains.data
-        head = (f"{len(d.hostnames)} in-scope names from {d.certificates_seen} certificate entries "
-                f"(`{d.query}`); {d.verified_count} verified via DNS"
+        head = (f"{len(d.hostnames)} in-scope names from {d.certificates_seen} certificate entries and "
+                f"{d.passive_entries_seen} passive-source entries (`{d.query}`); {d.verified_count} verified via DNS"
                 + (" + HTTPS/TLS" if d.http_checked else "") + f"; {d.out_of_scope_dropped} out-of-scope names dropped.\n")
-        providers = self._table(["Provider", "Status", "Entries", "Cached at", "Error"],
-                                [(p.provider, p.status, p.entries, p.cached_at.isoformat() if p.cached_at else None,
-                                  p.error) for p in d.providers])
+        out = [head, "**Certificate Transparency providers**", "",
+               self._table(["Provider", "Status", "Entries", "Cached at", "Error"],
+                           [(p.provider, p.status, p.entries, p.cached_at.isoformat() if p.cached_at else None,
+                             p.error) for p in d.providers])]
+        if d.sources:
+            out += ["**Passive sources**", "",
+                    self._table(["Source", "Kind", "Status", "Entries", "Names", "Cached at", "Note"],
+                                [(p.provider, p.kind, p.status, p.entries, p.names,
+                                  p.cached_at.isoformat() if p.cached_at else None,
+                                  p.error or p.skip_reason) for p in d.sources])]
+        else:
+            out += ["_No passive sources were enabled; Certificate Transparency only "
+                    "(see `--subdomain-source`)._", ""]
+        perm = d.permutation
+        if perm.enabled:
+            out += [f"**Permutation**: {perm.generated} candidate(s) generated from a {perm.wordlist_size}-word "
+                    f"list, {perm.tested} resolved (cap {perm.limit}"
+                    + (", truncated" if perm.truncated else "") + f"), **{perm.resolved}** resolve and were added.",
+                    "", f"> {perm.note}", ""]
         rows = []
         for h in d.hostnames:
             rows.append((h.hostname + (" (wildcard only)" if h.wildcard else ""), h.state.value,
@@ -358,9 +382,9 @@ class MarkdownReportWriter(ReportWriter):
                          {True: "ok", False: h.tls_error or "failed", None: None}[h.tls_ok],
                          h.sources, h.first_seen.date().isoformat() if h.first_seen else None,
                          h.last_seen.date().isoformat() if h.last_seen else None, h.certificate_count))
-        return (head + "\n**Providers**\n\n" + providers + "\n" +
-                self._table(["Hostname", "State", "DNS", "Addresses", "HTTPS", "TLS", "Sources", "First cert",
-                             "Last expiry", "Certs"], rows) + f"\n> {d.note}\n")
+        out += [self._table(["Hostname", "State", "DNS", "Addresses", "HTTPS", "TLS", "Sources", "First seen",
+                             "Last seen", "Certs"], rows), f"> {d.note}", ""]
+        return "\n".join(out)
 
     def _third_party(self) -> str:
         '''
@@ -381,6 +405,67 @@ class MarkdownReportWriter(ReportWriter):
                     self._table(["Domain group", "Hosts", "Sources", "Confidence"],
                            [(s.provider, s.domains[:4], s.sources, s.confidence.value) for s in unknown])]
         return "\n".join(out)
+
+    def _historical(self) -> str:
+        '''
+        Render the archived-URL surface: sources, date range, endpoints, parameters and legacy tech hints.
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.historical):
+            return msg
+        d = self.report.historical.data
+        window = " → ".join(filter(None, [d.first_seen.date().isoformat() if d.first_seen else None,
+                                          d.last_seen.date().isoformat() if d.last_seen else None])) or "unknown"
+        out = [f"**{d.urls_seen}** archived URL(s) across {len(d.hosts)} in-scope hostname(s) and "
+               f"{len(d.paths)} distinct path(s); archived {window}; "
+               f"{d.out_of_scope_dropped} out-of-scope URL(s) dropped"
+               + (f"; per-source cap {d.limit} reached" if d.truncated else "") + ".\n",
+               "**Sources**", "",
+               self._table(["Source", "Status", "URLs", "Note"],
+                           [(s.source, s.status, s.urls, s.error or s.skip_reason) for s in d.sources])]
+        if d.endpoints:
+            out += ["**Archived endpoint surface** (API-looking paths; verify manually — these may be gone)", "",
+                    "\n".join(f"- `{self._cell(p)}`" for p in d.endpoints[:40]), ""]
+        if d.parameters:
+            out += ["**Query parameters** (values are redacted; names only)", "",
+                    self._table(["Parameter", "Class", "URLs", "Example path", "Last seen"],
+                                [(p.name, p.category, p.occurrences, p.paths[0] if p.paths else None,
+                                  p.last_seen.date().isoformat() if p.last_seen else None)
+                                 for p in d.parameters[:40]])]
+        if d.tech_hints:
+            out += ["**Technology hints from archived paths** (what served these paths at the time — "
+                    "not the current stack)", "",
+                    self._table(["Technology", "Category", "Hint strength", "Paths", "Last seen",
+                                 "Still detected now"],
+                                [(h.name, h.category, h.confidence.value, h.occurrences,
+                                  h.last_seen.date().isoformat() if h.last_seen else None,
+                                  {True: "yes", False: "no", None: "not checked"}[h.still_detected])
+                                 for h in d.tech_hints[:30]])]
+        if d.sensitive_paths:
+            out += ["**Sensitive-looking archived paths**", "",
+                    "\n".join(f"- `{self._cell(u)}`" for u in d.sensitive_paths[:25]), ""]
+        if d.extensions:
+            out += ["**File extensions seen**: " + ", ".join(f"`{k}` ({v})" for k, v in d.extensions.items()), ""]
+        out += [f"> {d.note}", ""]
+        return "\n".join(out)
+
+    def _cloud(self) -> str:
+        '''
+        Render the managed-cloud resource inventory (references only; nothing was contacted).
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.third_party):
+            return msg
+        d = self.report.third_party.data
+        if not d.cloud_resources:
+            return "_No managed-cloud endpoints were referenced in the collected evidence._\n"
+        rows = [(r.provider, r.kind, r.identifier, r.region, r.host, r.sources, r.confidence.value,
+                 "yes" if r.public_by_default else "no", r.note) for r in d.cloud_resources]
+        return (self._table(["Provider", "Kind", "Identifier", "Region", "Host", "Sources", "Confidence",
+                             "Public-by-default class", "Note"], rows)
+                + f"\n> {d.cloud_note}\n")
 
     def _infrastructure(self) -> str:
         '''
@@ -501,6 +586,89 @@ class MarkdownReportWriter(ReportWriter):
         if d.discovered:
             out += [f"**Discovered but not fetched** ({len(d.discovered)})", "",
                     self._table(["URL", "From", "Reason"], [(u.url, u.source_url, u.reason) for u in d.discovered[:100]])]
+        return "\n".join(out)
+
+    def _seo(self) -> str:
+        '''
+        Render the SEO audit: grade, every check with its own denominator, and the page-level evidence.
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.seo):
+            return msg
+        d = self.report.seo.data
+        grade = self.report.analysis.seo
+        out: list[str] = []
+        if grade is not None:
+            out += [(f"**SEO grade: {grade.grade}** ({grade.score}/100) — {d.pages_analyzed} page(s) "
+                     f"analyzed ({d.pages_source}); check set {grade.checks_version}"), "",
+                    self._table(["Area", "Grade", "Score", "Failing checks", "Points deducted"],
+                                [(a.label, a.grade, a.score, a.findings, a.penalty) for a in grade.areas]),
+                    f"> {grade.note}", ""]
+            skipped = [c for c in grade.checks if c.status == "not_checked"]
+            out += ["**Checks**", "",
+                    self._table(["Check", "Area", "Scope", "Result", "Affected", "Checked", "Deducted",
+                                 "Detail"],
+                                [(c.label, c.area, c.scope,
+                                  {"fail": "FAIL", "pass": "pass"}.get(c.status, "not checked"),
+                                  c.affected if c.status != "not_checked" else None,
+                                  c.checked if c.status != "not_checked" else None,
+                                  c.penalty or None, c.detail or c.note)
+                                 for c in grade.checks])]
+            if skipped:
+                out += [(f"{len(skipped)} of {len(grade.checks)} check(s) had no evidence to evaluate "
+                         "and scored nothing (they are not passes)."), ""]
+        out += ["**Analyzed pages**", "",
+                self._table(["URL", "Status", "Indexable", "Title (chars)", "Description (chars)", "H1",
+                             "Words", "Images w/o alt", "Canonical", "Depth"],
+                            [(p.url, p.status_code, "yes" if p.indexable else
+                              "no (" + ", ".join(p.index_blockers) + ")",
+                              f"{p.title_length}" if p.title else "missing",
+                              f"{p.description_length}" if p.meta_description else "missing",
+                              len(p.h1), p.word_count, p.images_missing_alt or None,
+                              "self" if p.canonical_self else (p.canonical or "missing"), p.depth)
+                             for p in d.pages[:60]])]
+        if d.duplicates:
+            out += ["**Duplicate titles, descriptions and H1s**", "",
+                    self._table(["Kind", "Value", "Pages"],
+                                [(g.kind, g.value[:80], f"{len(g.pages)}: " + ", ".join(g.pages[:4]))
+                                 for g in d.duplicates[:25]])]
+        if (sm := d.sitemap) is not None:
+            out += ["**robots.txt and sitemap**", "",
+                    self._table(["Field", "Value"], [
+                        ("robots.txt present", "yes" if sm.robots_txt_present else "no"),
+                        ("Sitemap declared in robots.txt", "yes" if sm.robots_declares_sitemap else "no"),
+                        ("Sitemaps fetched", sm.sitemap_count),
+                        ("URLs listed in sitemaps", sm.sitemap_urls),
+                        ("Analyzed pages in a sitemap", f"{sm.crawled_in_sitemap} of {sm.crawled_pages}"),
+                        ("Listed URLs not reached by this crawl", sm.in_sitemap_not_crawled),
+                        ("Listed but blocked from indexing", sm.sitemap_noindex),
+                        ("Listed but returning an error", sm.sitemap_errors),
+                        ("Disallowed by robots.txt", sm.robots_blocked_pages)])]
+        links = [("Orphan pages (no inbound link among analyzed pages)", d.orphan_pages),
+                 ("Broken internal URLs", [f"{b.url} → {b.status_code or b.error}" for b in d.broken_links]),
+                 ("Internal URLs that redirect", [f"{r.url} → {r.final_url}" for r in d.redirects])]
+        if any(items for _, items in links):
+            out += ["**Internal links**", ""]
+            for label, items in links:
+                if items:
+                    out += [f"{label}: {len(items)}", "",
+                            "\n".join(f"- `{self._cell(i)}`" for i in items[:20]), ""]
+        if d.structured_data:
+            out += ["**Structured data** (pages declaring each type): "
+                    + ", ".join(f"`{k}` ({v})" for k, v in d.structured_data.items()), ""]
+        if hc := d.host_canonical:
+            out += ["**Host canonicalization**: "
+                    + (f"single host `{hc.canonical_host}`" if hc.canonical_host else
+                       f"{len(hc.hosts_serving)} host(s) serving: " + ", ".join(hc.hosts_serving)
+                       if hc.hosts_serving else "no host variant answered")
+                    + "; HTTP→HTTPS: "
+                    + {True: "yes", False: "no", None: "not probed"}[hc.https_redirects] + ".", ""]
+        out += ["**Delivery**: "
+                + f"compression `{d.compression or 'none'}`, {d.http_version or 'unknown'} version, "
+                + f"median response {d.median_response_ms or 0:.0f} ms, slowest "
+                + f"{d.slowest_response_ms or 0:.0f} ms, {d.total_html_bytes // 1024} KB of HTML total.", ""]
+        out += [f"> {d.note}", ""]
         return "\n".join(out)
 
     def _assets(self) -> str:

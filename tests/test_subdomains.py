@@ -36,7 +36,11 @@ CERTSPOTTER = [
 
 
 class StubDns:
+    def __init__(self):
+        self.queried: list[tuple[str, str]] = []   # so a test can assert DNS was the only thing used
+
     async def query(self, name, rtype):
+        self.queried.append((name, rtype))
         table = {
             ("www.example.com", "A"): ["93.184.216.34"],
             ("example.com", "A"): ["93.184.216.34"],
@@ -191,3 +195,95 @@ def test_normalize_discovered(raw, expected):
 ])
 def test_registrable_domain(host, expected):
     assert registrable_domain(host) == expected
+
+
+# ------------------------------------------------------------------ controlled permutation
+
+from recon.modules import SubdomainPermuter
+
+
+def permuter(host="example.com"):
+    return SubdomainPermuter(host, Scope.for_target(host))
+
+
+def test_permutation_applies_the_wordlist_to_the_target_and_discovered_zones():
+    candidates, total = permuter().generate(["api.example.com", "a.eu.example.com"], limit=5000)
+    assert "dev.example.com" in candidates and "staging.example.com" in candidates
+    assert "dev.eu.example.com" in candidates          # a discovered sub-zone is a base too
+    assert total == len(candidates)
+
+
+def test_permutation_mutates_labels_that_were_actually_observed():
+    candidates, _ = permuter().generate(["api.example.com"], limit=5000)
+    assert "api-dev.example.com" in candidates and "dev-api.example.com" in candidates
+    assert "api2.example.com" in candidates
+    # the numeric/env suffix is stripped before mutating, so api2 → api3 rather than api2-dev only
+    assert "api3.example.com" in permuter().generate(["api2.example.com"], limit=5000)[0]
+
+
+def test_permutation_never_leaves_scope_or_repeats_a_known_name():
+    candidates, _ = permuter().generate(["api.example.com", "www.example.com"], limit=5000)
+    assert all(c.endswith(".example.com") for c in candidates)
+    assert "api.example.com" not in candidates and "example.com" not in candidates
+    # a name discovered under a different registrable domain contributes no candidates
+    assert not any("evil.test" in c for c in permuter().generate(["x.evil.test"], limit=5000)[0])
+
+
+def test_permutation_is_hard_capped_and_reports_truncation():
+    candidates, total = permuter().generate(["api.example.com"], limit=7)
+    assert len(candidates) == 7 and total > 7
+    assert permuter().generate(["api.example.com"], limit=0) == ([], 0)
+
+
+def test_permutation_skips_wildcards_and_overlong_names():
+    long_label = "x" * 250
+    candidates, _ = permuter().generate(["*.example.com", f"{long_label}.example.com"], limit=5000)
+    assert not any(c.startswith("*") for c in candidates)
+    assert all(len(c) <= 253 for c in candidates)
+
+
+@respx.mock
+async def test_permutation_keeps_only_names_that_resolve_and_never_fetches_them():
+    mock_providers()
+    probe = respx.get(url__startswith="https://dev.example.com")
+    dns = StubDns()
+    async with ct_client() as ct:
+        data, _ = await SubdomainCollector("example.com", ct, dns, permute=True, permutation_limit=40).collect()
+    by = {r.hostname: r for r in data.hostnames}
+    # StubDns resolves only its own table, so no generated candidate resolves and none is reported
+    generated = [r for r in data.hostnames if "permutation" in r.sources]
+    assert generated == []
+    assert data.permutation.enabled and data.permutation.tested == 40 and data.permutation.resolved == 0
+    assert data.permutation.truncated and data.permutation.limit == 40
+    assert not probe.called                      # DNS only: a generated name is never requested over HTTP
+    assert all(rtype in ("A", "AAAA", "CNAME") for _, rtype in dns.queried)
+    assert "www.example.com" in by               # names from the CT providers are unaffected
+
+
+@respx.mock
+async def test_a_resolving_generated_name_is_added_with_permutation_as_its_source():
+    mock_providers()
+
+    class Resolving(StubDns):
+        async def query(self, name, rtype):
+            if name == "staging.example.com" and rtype == "A":
+                return DnsQueryResult(name=name, record_type=rtype, status=DnsQueryStatus.NOERROR,
+                                      records=[DnsRecord(value="93.184.216.40")], response_time_ms=1)
+            return await super().query(name, rtype)
+
+    async with ct_client() as ct:
+        data, _ = await SubdomainCollector("example.com", ct, Resolving(), permute=True,
+                                           permutation_limit=200).collect()
+    record = next(r for r in data.hostnames if r.hostname == "staging.example.com")
+    assert record.sources == ["permutation"] and record.resolves is True
+    assert record.addresses == ["93.184.216.40"] and record.state is HostState.RESOLVING
+    assert data.permutation.resolved == 1
+
+
+@respx.mock
+async def test_permutation_is_off_unless_enabled():
+    mock_providers()
+    async with ct_client() as ct:
+        data, _ = await SubdomainCollector("example.com", ct, StubDns()).collect()
+    assert data.permutation.enabled is False and data.permutation.tested == 0
+    assert not any("permutation" in r.sources for r in data.hostnames)

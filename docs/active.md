@@ -104,7 +104,15 @@ max_requests_per_check: 100
 siterecon active example.com --authorization auth.yaml --bypass-sec --format all
 ```
 
-It runs a passive scan, derives the scope from the target itself (**no `scope` or `auto_discover` to
+Its passive scan runs **wide**: deep crawl (depth 10, 100 pages), headless rendering, subdomain HTTPS/TLS
+probing, the OSV vulnerability lookup, **every passive subdomain source**, **DNS-confirmed generated
+hostnames**, and the **archived-URL surface** — with the discovery caps raised to match (500 names
+verified, 1000 generated candidates, 5000 archived URLs per archive). Those capabilities are opt-in in a
+normal `scan` because each discloses the target domain to a third party (web archives, passive-DNS
+datasets, osv.dev); `--bypass-sec` is a local run on your own property, so it accepts that cost and says so
+in its banner. See [passive-discovery.md](passive-discovery.md) for what each source contributes.
+
+It then derives the scope from the target itself (**no `scope` or `auto_discover` to
 write**), and runs the **complete** check set except email — `tls_protocol_enum`,
 `function_url_reachability`, `client_ip_header_trust`, `backend_read_access`, `port_scan` and `traceroute`
 — across everything under the target's domain and the backends the site embeds. To test the backend it

@@ -26,8 +26,11 @@ def _finding(confidence, state=None):
 
 # ------------------------------------------------------------------ schema version
 
-def test_schema_version_bumped_to_2_2():
-    assert SCHEMA_VERSION == "2.3"
+def test_schema_version_is_current():
+    # 2.4 adds the historical module, per-source subdomain discovery results, the permutation summary and
+    # the managed-cloud inventory; 2.5 adds the seo module and the separate SEO grade. Every addition is
+    # optional with a default, so older reports still load.
+    assert SCHEMA_VERSION == "2.5"
 
 
 # ------------------------------------------------------------------ provenance stamping

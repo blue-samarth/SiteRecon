@@ -39,6 +39,8 @@ _COLLECTION_METHOD: dict[str, CollectionMethod] = {
     "third_party": CollectionMethod.DERIVED,
     "render": CollectionMethod.BROWSER_RENDER,
     "vulnscan": CollectionMethod.EXTERNAL_API,
+    "historical": CollectionMethod.EXTERNAL_API,
+    "seo": CollectionMethod.STATIC_ANALYSIS,
 }
 
 
@@ -47,6 +49,8 @@ class ObservationBuilder:
     Converts module data into Observation records (one per comparable fact).
     Volatile values (timings, TTLs, request IDs) are deliberately excluded so comparisons stay meaningful.
     '''
+
+    MAX_SEO_PAGES: int = 50
 
     def __init__(self, hostname: str, modules: dict[str, ModuleResult]) -> None:
         '''
@@ -61,6 +65,31 @@ class ObservationBuilder:
 
     @staticmethod
     def make_id(type_: str, target: str, key: str) -> str: return hashlib.sha1(f"{type_}|{target}|{key}".encode()).hexdigest()[:12]
+
+    @staticmethod
+    def _discovery_method(sources: list[str]) -> str:
+        '''
+        The collection method that actually produced a discovered hostname.
+
+        The subdomains module now has three discovery paths with genuinely different provenance, and the
+        module-level default (CT_LOG) would misattribute two of them: a name confirmed by resolving a
+        generated candidate came from a DNS query, and a name only a passive dataset knows came from a
+        third-party API. Certificate Transparency wins when any CT provider saw the name, because that is
+        the strongest evidence present.
+        Parameters:
+            sources (list[str]): Source names credited on the record (may include 'cache:<source>').
+
+        Returns:
+            str: The CollectionMethod value describing how the name was learned.
+        '''
+        plain = {s.removeprefix("cache:") for s in sources}
+        if plain & {"crt.sh", "certspotter"}:
+            return CollectionMethod.CT_LOG
+        if plain == {"permutation"}:
+            return CollectionMethod.DNS_QUERY
+        if plain:
+            return CollectionMethod.EXTERNAL_API
+        return CollectionMethod.CT_LOG
 
     def build(self) -> list[Observation]:
         '''
@@ -79,7 +108,7 @@ class ObservationBuilder:
     def _add(self, result: ModuleResult, type_: str, target: str, key: str, value: Any, source: str,
              confidence: Confidence = Confidence.HIGH, *, collection_method: str | None = None,
              external_provider: str | None = None, observed_at: datetime | None = None,
-             freshness: Freshness | None = None) -> None:
+             freshness: Freshness | None = None, limitations: list[str] | None = None) -> None:
         '''
         Record one observation; the first one recorded for a (type, target, key) wins, so probes that end
         at the same URL (e.g. https:// and https://www. redirecting to one page) are not duplicated.
@@ -95,6 +124,8 @@ class ObservationBuilder:
             external_provider (str | None): Third-party/offline provider this fact came from, if any.
             observed_at (datetime | None): When the fact was true at the source, if different from collection.
             freshness (Freshness | None): Override the default freshness (FRESH for direct collection).
+            limitations (list[str] | None): What this observation cannot establish (carried into reports so
+                a historical or indirect value is never read as a current, direct one).
         '''
         obs_id: str = self.make_id(type_, target, key)
         if obs_id in self._out: return
@@ -105,7 +136,7 @@ class ObservationBuilder:
             collection_method=collection_method or _COLLECTION_METHOD.get(result.module, CollectionMethod.UNKNOWN),
             timestamp=result.finished_at, observed_at=observed_at, confidence=confidence,
             freshness=freshness or Freshness.FRESH, external_provider=external_provider,
-            status=result.status.value)
+            limitations=list(limitations or []), status=result.status.value)
 
     def _dns(self, r: ModuleResult) -> None:
         '''
@@ -320,6 +351,96 @@ class ObservationBuilder:
                       f"OSV lookup of {comp.package}@{comp.version}", Confidence.MEDIUM,
                       external_provider="OSV")
 
+    def _historical(self, r: ModuleResult) -> None:
+        '''
+        Archived-URL surface: the paths, endpoints, parameters and legacy technology hints the archives hold.
+
+        Everything here is explicitly historical — collected from a third-party archive, describing a past
+        state — so each observation carries EXTERNAL_API provenance, HISTORICAL freshness and the archive's
+        own last-seen timestamp as ``observed_at``. Individual URLs are not recorded one-by-one: a URL set
+        churns constantly, and a diff of thousands of archived URLs would drown the real changes. The
+        summary, the endpoint surface, the parameter classes and the hints are what stay comparable.
+        Parameters:
+            r (ModuleResult): Historical-URL module result.
+        '''
+        d = r.data
+        providers = ", ".join(s.source for s in d.sources if s.status == "live") or "archives"
+        limits = ["Archived data is historical; a URL here may no longer exist or be reachable."]
+        self._add(r, "historical.summary", d.host, "urls",
+                  {"urls": d.urls_seen, "hosts": len(d.hosts), "paths": len(d.paths),
+                   "first": d.first_seen.date().isoformat() if d.first_seen else None,
+                   "last": d.last_seen.date().isoformat() if d.last_seen else None},
+                  providers, Confidence.MEDIUM, freshness=Freshness.HISTORICAL,
+                  observed_at=d.last_seen, external_provider=providers, limitations=limits)
+        if d.endpoints:
+            self._add(r, "historical.endpoints", d.host, "paths", sorted(d.endpoints), providers,
+                      Confidence.MEDIUM, freshness=Freshness.HISTORICAL, observed_at=d.last_seen,
+                      external_provider=providers, limitations=limits)
+        for param in d.parameters:
+            if param.category in ("credential", "redirect", "file"):
+                self._add(r, "historical.parameter", d.host, param.name,
+                          {"category": param.category, "occurrences": param.occurrences}, providers,
+                          Confidence.MEDIUM, freshness=Freshness.HISTORICAL, observed_at=param.last_seen,
+                          external_provider=providers, limitations=limits)
+        for hint in d.tech_hints:
+            self._add(r, "historical.technology", d.host, hint.name,
+                      {"category": hint.category, "occurrences": hint.occurrences,
+                       "still_detected": hint.still_detected}, providers, hint.confidence,
+                      freshness=Freshness.HISTORICAL, observed_at=hint.last_seen,
+                      external_provider=providers,
+                      limitations=["Describes the stack that served an archived path, not the current one."])
+        if d.sensitive_paths:
+            self._add(r, "historical.sensitive_paths", d.host, "count", len(d.sensitive_paths), providers,
+                      Confidence.MEDIUM, freshness=Freshness.HISTORICAL, observed_at=d.last_seen,
+                      external_provider=providers, limitations=limits)
+
+    def _seo(self, r: ModuleResult) -> None:
+        '''
+        Record the SEO facts worth diffing across scans.
+
+        Per-page records are the ones that catch real regressions — a title that disappears, a page that
+        turns noindex, a canonical that starts pointing elsewhere — so they are recorded per URL rather
+        than as a site-wide count. The number of pages observed is capped, because the page list grows
+        with --max-pages and a diff of a thousand near-identical rows helps nobody. Volatile measurements
+        (word counts, response times, byte sizes) are deliberately left out: they change on every edit and
+        would bury the structural changes in noise.
+        Parameters:
+            r (ModuleResult): The seo module result.
+        '''
+        d = r.data
+        source = f"SEO audit of {d.pages_analyzed} page(s) ({d.pages_source})"
+        self._add(r, "seo.summary", d.host, "pages_analyzed", d.pages_analyzed, source)
+        self._add(r, "seo.summary", d.host, "indexable_pages", d.indexable_pages, source)
+        self._add(r, "seo.summary", d.host, "coverage", d.pages_source, source)
+        self._add(r, "seo.delivery", d.host, "compression", d.compression or "none", source)
+        if d.http_version:
+            self._add(r, "seo.delivery", d.host, "http_version", d.http_version, source)
+        if d.languages:
+            self._add(r, "seo.content", d.host, "languages", d.languages, source)
+        if d.structured_data:
+            self._add(r, "seo.content", d.host, "structured_data_types", sorted(d.structured_data), source)
+        for kind in ("title", "description", "h1"):
+            groups = [g for g in d.duplicates if g.kind == kind]
+            if groups:
+                self._add(r, "seo.duplicates", d.host, kind, len(groups), source)
+        if d.sitemap is not None:
+            s = d.sitemap
+            self._add(r, "seo.sitemap", d.host, "robots_txt", s.robots_txt_present, source)
+            self._add(r, "seo.sitemap", d.host, "declared_in_robots", s.robots_declares_sitemap, source)
+            self._add(r, "seo.sitemap", d.host, "urls_listed", s.sitemap_urls, source)
+        if d.host_canonical is not None and d.host_canonical.hosts_serving:
+            self._add(r, "seo.canonicalization", d.host, "hosts_serving",
+                      d.host_canonical.hosts_serving, source)
+        for page in d.pages[: self.MAX_SEO_PAGES]:
+            where = f"HTML of {page.url}"
+            self._add(r, "seo.page", page.url, "indexable", page.indexable, where)
+            if page.index_blockers:
+                self._add(r, "seo.page", page.url, "index_blockers", sorted(set(page.index_blockers)), where)
+            for key, value in (("title", page.title), ("description", page.meta_description),
+                               ("canonical", page.canonical), ("h1", page.h1 or None)):
+                if value:
+                    self._add(r, "seo.page", page.url, key, value, where)
+
     def _technology(self, r: ModuleResult) -> None:
         '''
         Detected technologies with status and version.
@@ -343,12 +464,32 @@ class ObservationBuilder:
 
     def _subdomains(self, r: ModuleResult) -> None:
         '''
-        Discovered hostnames and their verified state.
+        Discovered hostnames with their verified state, plus which sources know each one.
+
+        The state is kept as the comparable value so a host becoming reachable (or disappearing) shows up
+        in the scan diff. The source list is a separate observation, so gaining a name from a newly enabled
+        source is visible as an added observation rather than silently changing the host's own record.
         Parameters:
             r (ModuleResult): Subdomains module result.
         '''
-        for h in r.data.hostnames:
-            self._add(r, "subdomain", self.hostname, h.hostname, h.state.value, ", ".join(h.sources))
+        d = r.data
+        for h in d.hostnames:
+            source_text = ", ".join(h.sources)
+            method = self._discovery_method(h.sources)
+            self._add(r, "subdomain", self.hostname, h.hostname, h.state.value, source_text,
+                      collection_method=method)
+            self._add(r, "subdomain.sources", h.hostname, "sources", sorted(h.sources),
+                      source_text or "discovery source", collection_method=method)
+        if d.sources:
+            self._add(r, "subdomain.coverage", self.hostname, "sources",
+                      {s.provider: s.status for s in sorted(d.sources, key=lambda s: s.provider)},
+                      "passive discovery sources queried", Confidence.HIGH)
+        if d.permutation.enabled:
+            self._add(r, "subdomain.permutation", self.hostname, "summary",
+                      {"generated": d.permutation.generated, "tested": d.permutation.tested,
+                       "resolved": d.permutation.resolved},
+                      "generated candidates confirmed in DNS", Confidence.HIGH,
+                      collection_method=CollectionMethod.DNS_QUERY)
 
     def _third_party(self, r: ModuleResult) -> None:
         '''
@@ -359,3 +500,9 @@ class ObservationBuilder:
         for s in r.data.services:
             self._add(r, "third_party", self.hostname, f"{s.provider}|{s.category}", sorted(s.domains),
                       ", ".join(s.sources), s.confidence)
+        for c in r.data.cloud_resources:
+            # The referenced identifier is the comparable fact; a new bucket or function appearing in the
+            # client surface is exactly the kind of change the diff should surface.
+            self._add(r, "cloud.resource", self.hostname, f"{c.provider}|{c.kind}|{c.identifier}",
+                      {"host": c.host, "region": c.region, "sources": sorted(c.sources)},
+                      ", ".join(c.sources) or "referenced in collected evidence", c.confidence)

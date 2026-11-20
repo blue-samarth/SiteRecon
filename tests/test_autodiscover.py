@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from recon.active import apply_synthesis, synthesize
 from recon.active.authorization import AuthorizationFile, AutoDiscover
 from recon.cli import app
+from recon.orchestrator import ScanOrchestrator
 from recon.models import (
     AnalysisResult,
     AssetData,
@@ -190,6 +191,67 @@ def test_bypass_sec_works_with_a_minimal_auth(tmp_path):
                               "--now", "2026-11-13T12:00:00Z"])
     assert res.exit_code == 0, res.output
     assert "bypass-sec" in " ".join(res.output.split())
+
+
+def test_bypass_sec_enables_every_opt_in_passive_capability(tmp_path, monkeypatch):
+    # --bypass-sec is the "this is mine, find everything" mode: it must turn on the passive capabilities
+    # that are otherwise off, including the ones that disclose the domain to a third party. Capturing the
+    # Config here keeps that coupling from silently regressing when a new opt-in is added.
+    captured: dict[str, object] = {}
+    real_init = ScanOrchestrator.__init__
+
+    def capture(self, config, **kwargs):
+        captured["config"] = config
+        real_init(self, config, **kwargs)
+
+    async def no_scan(self, progress=None):
+        raise RuntimeError("stop after the config is built")
+
+    monkeypatch.setattr(ScanOrchestrator, "__init__", capture)
+    monkeypatch.setattr(ScanOrchestrator, "run", no_scan)
+    plain = tmp_path / "plain.yaml"
+    plain.write_text(MINIMAL, encoding="utf-8")
+    runner.invoke(app, ["active", "clusterheart.com", "-A", str(plain), "--bypass-sec", "-o", str(tmp_path),
+                        "--now", "2026-11-13T12:00:00Z"])
+    cfg = captured["config"]
+    assert cfg.subdomain_sources == ("all",) and cfg.permute_subdomains is True and cfg.historical is True
+    assert cfg.render and cfg.probe_subdomains and cfg.check_vulns and cfg.retain_client_keys
+    # the caps widen with the mode, so the extra sources are not immediately truncated away
+    assert cfg.max_permutations == 1000 and cfg.max_historical_urls == 5000 and cfg.max_subdomains == 500
+    assert cfg.crawl and cfg.crawl_depth == 10 and cfg.max_pages == 100
+
+
+def test_the_passive_scan_without_bypass_sec_stays_narrow(tmp_path, monkeypatch):
+    # Without the flag, an active run's preliminary scan must not start contacting archives and datasets.
+    captured: dict[str, object] = {}
+    real_init = ScanOrchestrator.__init__
+
+    def capture(self, config, **kwargs):
+        captured["config"] = config
+        real_init(self, config, **kwargs)
+
+    async def no_scan(self, progress=None):
+        raise RuntimeError("stop after the config is built")
+
+    monkeypatch.setattr(ScanOrchestrator, "__init__", capture)
+    monkeypatch.setattr(ScanOrchestrator, "run", no_scan)
+    path = tmp_path / "auto.yaml"
+    path.write_text(AUTO_YAML, encoding="utf-8")
+    runner.invoke(app, ["active", "clusterheart.com", "-A", str(path), "-o", str(tmp_path),
+                        "--now", "2026-11-11T12:00:00Z"])
+    cfg = captured["config"]
+    assert cfg.subdomain_sources == () and cfg.permute_subdomains is False and cfg.historical is False
+    assert cfg.max_subdomains == 100 and cfg.max_permutations == 200
+
+
+def test_bypass_sec_announces_the_extra_disclosure(tmp_path):
+    plain = tmp_path / "plain.yaml"
+    plain.write_text(MINIMAL, encoding="utf-8")
+    res = runner.invoke(app, ["active", "clusterheart.com", "-A", str(plain), "--bypass-sec", "--dry-run",
+                              "--now", "2026-11-13T12:00:00Z"])
+    flat = " ".join(res.output.split())
+    assert res.exit_code == 0, res.output
+    assert "archived URLs" in flat and "generated names" in flat
 
 
 def test_bypass_sec_needs_the_passive_scan(tmp_path):

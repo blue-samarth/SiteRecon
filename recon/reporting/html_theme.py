@@ -14,8 +14,9 @@ from typing import Any
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Overview", ("summary", "target", "findings", "changes")),
     ("Network", ("dns", "dnssec", "network", "tls", "whois")),
-    ("Web", ("http", "resources", "technology", "html", "crawl", "assets", "cookies")),
-    ("Discovery", ("subdomains", "third-party", "infrastructure")),
+    ("Web", ("http", "resources", "technology", "html", "crawl", "seo", "assets", "render", "vulns",
+             "cookies")),
+    ("Discovery", ("subdomains", "historical", "third-party", "cloud", "infrastructure")),
     ("Reference", ("errors", "raw", "sources")),
 )
 

@@ -38,8 +38,9 @@ class HtmlReportWriter(ReportWriter):
         ("summary", "Executive Summary"), ("target", "Target"), ("findings", "Security Observations"),
         ("changes", "Changes"), ("dns", "DNS"), ("dnssec", "DNSSEC"), ("network", "Network & IP"),
         ("http", "HTTP / HTTPS"), ("tls", "TLS"), ("whois", "Registration"), ("resources", "Public Resources"),
-        ("technology", "Technologies"), ("html", "HTML"), ("crawl", "Crawl"), ("render", "Dynamic Render"), ("assets", "JS / CSS Assets"), ("vulns", "Known Vulns"), ("cookies", "Cookies"),
-        ("subdomains", "Subdomains"), ("third-party", "Third Parties"), ("infrastructure", "Infrastructure"),
+        ("technology", "Technologies"), ("html", "HTML"), ("crawl", "Crawl"), ("seo", "SEO Audit"), ("render", "Dynamic Render"), ("assets", "JS / CSS Assets"), ("vulns", "Known Vulns"), ("cookies", "Cookies"),
+        ("subdomains", "Subdomains"), ("historical", "Historical URLs"),
+        ("third-party", "Third Parties"), ("cloud", "Cloud Resources"), ("infrastructure", "Infrastructure"),
         ("errors", "Errors & Limitations"), ("raw", "Raw Data"), ("sources", "Sources"),
     )
 
@@ -73,6 +74,7 @@ class HtmlReportWriter(ReportWriter):
             "sources": self._sources(), "changes": self._changes(), "dnssec": self._dnssec(),
             "resources": self._resources(), "crawl": self._crawl(), "cookies": self._cookies(),
             "assets": self._assets(), "render": self._render(), "vulns": self._vulns(),
+            "historical": self._historical(), "cloud": self._cloud(), "seo": self._seo(),
         }
         nav = nav_html(self.SECTIONS)
         sections = "".join(
@@ -213,6 +215,12 @@ class HtmlReportWriter(ReportWriter):
             grade_html = (f"<p><strong>Security grade: {escape(grade.grade)}</strong> ({grade.score}/100)</p>"
                           + self._table(["Area", "Grade", "Score", "Findings"],
                                         [(a.label, a.grade, a.score, a.findings) for a in grade.areas]))
+        seo = r.analysis.seo
+        if seo is not None:
+            grade_html += (f"<p><strong>SEO grade: {escape(seo.grade)}</strong> ({seo.score}/100 across "
+                           f"{seo.pages_analyzed} page(s))</p>"
+                           + self._note("Scored separately from the security grade: SEO is content "
+                                        "quality, not security posture. See the SEO Audit section."))
         return (
             grade_html
             + severity_bar(counts, self.SEVERITY_ORDER)
@@ -507,15 +515,30 @@ class HtmlReportWriter(ReportWriter):
                          h.http_status or h.http_error, {True: "ok", False: h.tls_error or "failed", None: None}[h.tls_ok],
                          h.sources, h.first_seen.date().isoformat() if h.first_seen else None,
                          h.last_seen.date().isoformat() if h.last_seen else None, h.certificate_count, h.issuers))
+        kinds = {"live": "ok", "cached": "partial", "skipped": "skipped"}
         providers = self._table(["Provider", "Status", "Entries", "Cached at", "Error"],
-                                [(p.provider, self._pill(p.status, {"live": "ok", "cached": "partial"}.get(p.status, "failed")),
+                                [(p.provider, self._pill(p.status, kinds.get(p.status, "failed")),
                                   p.entries, p.cached_at, p.error) for p in d.providers])
-        return (f"<p>{len(d.hostnames)} in-scope names from {d.certificates_seen} certificate entries "
-                f"({self._code(d.query)}); {live} resolve now; {d.verified_count} verified"
+        sources = (self._table(["Source", "Kind", "Status", "Entries", "Names", "Cached at", "Note"],
+                               [(p.provider, p.kind, self._pill(p.status, kinds.get(p.status, "failed")),
+                                 p.entries, p.names, p.cached_at, p.error or p.skip_reason) for p in d.sources])
+                   if d.sources else
+                   '<p class="muted">No passive sources were enabled; Certificate Transparency only '
+                   '(see --subdomain-source).</p>')
+        perm = d.permutation
+        permutation = ""
+        if perm.enabled:
+            permutation = ("<h3>Permutation</h3>" + self._kv([
+                ("Candidates generated", perm.generated), ("Wordlist size", perm.wordlist_size),
+                ("Resolved (cap)", f"{perm.tested} ({perm.limit}{', truncated' if perm.truncated else ''})"),
+                ("Confirmed in DNS", perm.resolved)]) + self._note(perm.note))
+        return (f"<p>{len(d.hostnames)} in-scope names from {d.certificates_seen} certificate entries and "
+                f"{d.passive_entries_seen} passive-source entries ({self._code(d.query)}); {live} resolve now; "
+                f"{d.verified_count} verified"
                 f"{' (DNS + HTTPS/TLS)' if d.http_checked else ' (DNS)'}; {d.out_of_scope_dropped} out-of-scope names dropped.</p>"
-                + "<h3>CT providers</h3>" + providers
+                + "<h3>CT providers</h3>" + providers + "<h3>Passive sources</h3>" + sources + permutation
                 + self._table(["Hostname", "State", "DNS", "Addresses", "Private", "HTTPS", "TLS", "Sources",
-                               "First cert", "Last expiry", "Certs", "Issuers"], rows)
+                               "First seen", "Last seen", "Certs", "Issuers"], rows)
                 + self._note(d.note))
 
     def _dnssec(self) -> str:
@@ -601,6 +624,89 @@ class HtmlReportWriter(ReportWriter):
             out += f"<details><summary>Discovered but not fetched ({len(d.discovered)})</summary>" + self._table(
                 ["URL", "From", "Reason"], [(u.url, u.source_url, u.reason) for u in d.discovered]) + "</details>"
         return out
+
+    def _seo(self) -> str:
+        '''
+        Render the SEO audit: grade, every check with its denominator, and the page-level evidence.
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.seo):
+            return msg
+        d = self.report.seo.data
+        grade = self.report.analysis.seo
+        out: list[str] = []
+        if grade is not None:
+            out.append(f"<p><strong>SEO grade: {escape(grade.grade)}</strong> ({grade.score}/100) — "
+                       f"{d.pages_analyzed} page(s) analyzed ({self._e(d.pages_source)}); check set "
+                       f"{self._e(grade.checks_version)}</p>"
+                       + self._table(["Area", "Grade", "Score", "Failing checks", "Points deducted"],
+                                     [(a.label, a.grade, a.score, a.findings, a.penalty)
+                                      for a in grade.areas])
+                       + self._note(grade.note))
+            status_pill = {"fail": ("fail", "failed"), "pass": ("pass", "ok"),
+                           "not_checked": ("not checked", "skipped")}
+            out.append("<h3>Checks</h3>" + self._table(
+                ["Check", "Area", "Scope", "Result", "Affected", "Checked", "Deducted", "Detail"],
+                [(c.label, c.area, c.scope, self._pill(*status_pill[c.status]),
+                  c.affected if c.status != "not_checked" else None,
+                  c.checked if c.status != "not_checked" else None, c.penalty or None,
+                  c.detail or c.note) for c in grade.checks]))
+            skipped = sum(1 for c in grade.checks if c.status == "not_checked")
+            if skipped:
+                out.append(self._note(f"{skipped} of {len(grade.checks)} checks had no evidence to "
+                                      "evaluate and scored nothing — they are not passes."))
+        out.append("<h3>Analyzed pages</h3>" + self._table(
+            ["URL", "Status", "Indexable", "Title", "Description", "H1", "Words", "Images w/o alt",
+             "Canonical", "Depth"],
+            [(self._code(p.url), p.status_code,
+              self._pill("yes", "ok") if p.indexable
+              else self._pill(", ".join(p.index_blockers) or "no", "partial"),
+              f"{p.title_length} chars" if p.title else self._pill("missing", "failed"),
+              f"{p.description_length} chars" if p.meta_description else self._pill("missing", "partial"),
+              len(p.h1), p.word_count, p.images_missing_alt or None,
+              "self" if p.canonical_self else (self._code(p.canonical) if p.canonical
+                                               else self._pill("missing", "partial")),
+              p.depth) for p in d.pages[:80]]))
+        if d.duplicates:
+            out.append("<h3>Duplicate titles, descriptions and H1s</h3>" + self._table(
+                ["Kind", "Value", "Pages"],
+                [(g.kind, g.value[:120], f"{len(g.pages)}: " + ", ".join(g.pages[:4]))
+                 for g in d.duplicates[:30]]))
+        if (sm := d.sitemap) is not None:
+            out.append("<h3>robots.txt and sitemap</h3>" + self._kv([
+                ("robots.txt present", sm.robots_txt_present),
+                ("Sitemap declared in robots.txt", sm.robots_declares_sitemap),
+                ("Sitemaps fetched", sm.sitemap_count), ("URLs listed in sitemaps", sm.sitemap_urls),
+                ("Analyzed pages in a sitemap", f"{sm.crawled_in_sitemap} of {sm.crawled_pages}"),
+                ("Listed URLs not reached by this crawl", sm.in_sitemap_not_crawled),
+                ("Listed but blocked from indexing", sm.sitemap_noindex),
+                ("Listed but returning an error", sm.sitemap_errors),
+                ("Disallowed by robots.txt", sm.robots_blocked_pages)]))
+        groups = [("Orphan pages", "no inbound link from any analyzed page", d.orphan_pages),
+                  ("Broken internal URLs", "linked from the site, answered with an error",
+                   [f"{b.url} → {b.status_code or b.error}" for b in d.broken_links]),
+                  ("Internal URLs that redirect", "the link target is not the final URL",
+                   [f"{r.url} → {r.final_url}" for r in d.redirects])]
+        for title, why, items in groups:
+            if items:
+                out.append(f"<h3>{escape(title)}</h3><p class=\"muted\">{escape(why)}</p><ul>"
+                           + "".join(f"<li>{self._code(i)}</li>" for i in items[:25]) + "</ul>")
+        if d.structured_data:
+            out.append("<h3>Structured data</h3>" + self._table(
+                ["Type", "Pages declaring it"], list(d.structured_data.items())))
+        if (hc := d.host_canonical) is not None:
+            out.append("<h3>Host canonicalization</h3>" + self._kv([
+                ("Hosts serving the page themselves", hc.hosts_serving),
+                ("Single canonical host", hc.canonical_host),
+                ("HTTP reaches HTTPS", hc.https_redirects)]))
+        out.append("<h3>Delivery</h3>" + self._kv([
+            ("HTML compression", d.compression or "none"), ("HTTP version", d.http_version),
+            ("Median response", f"{d.median_response_ms:.0f} ms" if d.median_response_ms else None),
+            ("Slowest response", f"{d.slowest_response_ms:.0f} ms" if d.slowest_response_ms else None),
+            ("Total HTML analyzed", f"{d.total_html_bytes // 1024} KB"),
+            ("Declared languages", d.languages)]))
+        return "".join(out) + self._note(d.note)
 
     def _vulns(self) -> str:
         '''
@@ -771,6 +877,75 @@ class HtmlReportWriter(ReportWriter):
                 [(s.provider, s.domains, s.sources, self._pill(s.confidence.value, s.confidence.value), s.evidence)
                  for s in unknown])
         return out
+
+    def _historical(self) -> str:
+        '''
+        Render the archived-URL surface: sources, endpoints, parameters and legacy technology hints.
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.historical):
+            return msg
+        d = self.report.historical.data
+        out = [self._kv([
+            ("Archived URLs", d.urls_seen), ("Hostnames", len(d.hosts)), ("Distinct paths", len(d.paths)),
+            ("First archived", d.first_seen), ("Last archived", d.last_seen),
+            ("Out-of-scope dropped", d.out_of_scope_dropped),
+            ("Per-source cap", f"{d.limit}{' (reached)' if d.truncated else ''}")])]
+        out.append("<h3>Sources</h3>" + self._table(
+            ["Source", "Status", "URLs", "Note"],
+            [(s.source, self._pill(s.status, {"live": "ok", "skipped": "skipped"}.get(s.status, "failed")),
+              s.urls, s.error or s.skip_reason) for s in d.sources]))
+        if d.endpoints:
+            out.append("<h3>Archived endpoint surface</h3>"
+                       + '<p class="muted">API-looking paths the archives hold. Verify manually: a path here '
+                         'may no longer exist.</p><ul>'
+                       + "".join(f"<li>{self._code(p)}</li>" for p in d.endpoints[:60]) + "</ul>")
+        if d.parameters:
+            out.append("<h3>Query parameters</h3>"
+                       + '<p class="muted">Parameter names only — values are redacted and never stored.</p>'
+                       + self._table(["Parameter", "Class", "URLs", "Example path", "Last seen"],
+                                     [(Safe(f"<strong>{escape(p.name)}</strong>"), p.category, p.occurrences,
+                                       p.paths[0] if p.paths else None, p.last_seen)
+                                      for p in d.parameters[:50]]))
+        if d.tech_hints:
+            out.append("<h3>Technology hints from archived paths</h3>"
+                       + '<p class="muted">What served these paths when they were archived — not the current '
+                         'stack. The Technologies section covers what is detected now.</p>'
+                       + self._table(["Technology", "Category", "Hint strength", "Paths", "Last seen",
+                                      "Still detected"],
+                                     [(h.name, h.category,
+                                       self._pill(h.confidence.value, h.confidence.value), h.occurrences,
+                                       h.last_seen,
+                                       self._pill(*({True: ("yes", "ok"), False: ("no", "skipped")}
+                                                    .get(h.still_detected, ("not checked", "skipped")))))
+                                      for h in d.tech_hints[:40]]))
+        if d.sensitive_paths:
+            out.append("<h3>Sensitive-looking archived paths</h3><ul>"
+                       + "".join(f"<li>{self._code(u)}</li>" for u in d.sensitive_paths[:30]) + "</ul>")
+        if d.extensions:
+            out.append("<h3>File extensions</h3>" + self._table(
+                ["Extension", "URLs"], list(d.extensions.items())))
+        return "".join(out) + self._note(d.note)
+
+    def _cloud(self) -> str:
+        '''
+        Render the managed-cloud resource inventory (references only; nothing was contacted).
+        Returns:
+            str: Section body.
+        '''
+        if msg := self._unavailable(self.report.third_party):
+            return msg
+        d = self.report.third_party.data
+        if not d.cloud_resources:
+            return '<p class="muted">No managed-cloud endpoints were referenced in the collected evidence.</p>'
+        rows = [(Safe(f"<strong>{escape(r.provider)}</strong>"), r.kind, self._code(r.identifier), r.region,
+                 self._code(r.host), r.sources, self._pill(r.confidence.value, r.confidence.value),
+                 self._pill("yes", "partial") if r.public_by_default else self._pill("no", "ok"),
+                 r.note) for r in d.cloud_resources]
+        return (self._table(["Provider", "Kind", "Identifier", "Region", "Host", "Sources", "Confidence",
+                             "Public-by-default class", "Note"], rows)
+                + self._note(d.cloud_note))
 
     def _infrastructure(self) -> str:
         '''

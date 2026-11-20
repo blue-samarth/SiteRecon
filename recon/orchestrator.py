@@ -3,9 +3,9 @@ Coordinates collection → observations → analysis. Never generates presentati
 
 Sequence:
   1. DNS
-  2. network, HTTP, TLS, DNSSEC, registration, CT subdomains   (concurrent, bounded)
+  2. network, HTTP, TLS, DNSSEC, registration, subdomains, historical URLs   (concurrent, bounded)
   3. HTML → public resources → crawler → JS/CSS assets         (crawler seeded with sitemap URLs)
-  4. technology, cookies, third-party                          (derived from collected data)
+  4. technology, cookies, third-party, SEO audit               (derived from collected data)
   5. observations → analysis engine
 '''
 
@@ -15,6 +15,7 @@ import asyncio
 import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 from datetime import timedelta
 from time import perf_counter
 from typing import Any, ClassVar, TypeVar
@@ -52,11 +53,14 @@ from recon.modules import (
     CtCache,
     DnsCollector,
     DnssecCollector,
+    HistoricalUrlCollector,
     HtmlCollector,
     HttpCollector,
     NetworkCollector,
+    PassiveCache,
     Renderer,
     ResourcesCollector,
+    SeoCollector,
     SubdomainCollector,
     TechnologyCollector,
     ThirdPartyCollector,
@@ -64,6 +68,8 @@ from recon.modules import (
     VulnerabilityScanner,
     WhoisCollector,
 )
+from recon.modules import historical as historical_sources
+from recon.modules import subdomain_sources as passive_sources
 from recon.storage import ScanStore
 from recon.utils import DnsClient, GeoLocator, SafeHttpClient, Scope, get_logger
 
@@ -86,6 +92,21 @@ class ScanOrchestrator:
         "versioned asset path states one.",
         "Subresource Integrity is hash-verified for assets this scan downloaded; for assets that were not "
         "downloaded (off-scope third parties), only the presence of the attribute is reported.",
+        "Subdomain discovery is never exhaustive. Certificate Transparency is always queried; passive "
+        "datasets and archives are queried only when enabled with --subdomain-source, and each one "
+        "discloses the target domain to that provider. A name absent from the report is not evidence it "
+        "does not exist. Generated candidates (--permute-subdomains) are resolved in DNS only, capped, and "
+        "reported solely when they resolve.",
+        "Historical URLs (--historical) come from third-party web archives and URL indexes and describe the "
+        "past: a URL there may no longer exist, query values are redacted, and technology hints derived "
+        "from archived paths describe the stack that served them at the time, never the current one.",
+        "The SEO audit (--seo) re-reads the pages this scan already fetched: it covers exactly those "
+        "pages, judges the markup as served (JavaScript-rendered content counts only with --render), and "
+        "reports what the site declares about indexing — not what any search engine has indexed. Its "
+        "score is for tracking a site against its own history and predicts nothing about rankings.",
+        "Managed-cloud resources are inventoried from references only. SiteRecon never requests a bucket, "
+        "function or database endpoint, so it cannot establish whether any is reachable or publicly "
+        "readable; confirming that requires an authorized active check.",
     )
     _RDAP_ACCEPT: ClassVar[dict[str, str]] = {"Accept": "application/rdap+json, application/json"}
     log: ClassVar[logging.Logger] = get_logger("orchestrator")
@@ -99,6 +120,8 @@ class ScanOrchestrator:
         rdap_client: SafeHttpClient | None = None,
         ct_client: SafeHttpClient | None = None,
         dnssec_client: DnsClient | None = None,
+        passive_client: SafeHttpClient | None = None,
+        historical_client: SafeHttpClient | None = None,
         tls_kwargs: dict[str, Any] | None = None,
         whois_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -111,6 +134,8 @@ class ScanOrchestrator:
             rdap_client (SafeHttpClient | None): RDAP client override (tests).
             ct_client (SafeHttpClient | None): Certificate Transparency client override (tests).
             dnssec_client (DnsClient | None): Validating DNS client override (tests).
+            passive_client (SafeHttpClient | None): Passive-subdomain-source client override (tests).
+            historical_client (SafeHttpClient | None): Historical-URL-source client override (tests).
             tls_kwargs (dict[str, Any] | None): Extra keyword arguments for TlsCollector.
             whois_kwargs (dict[str, Any] | None): Extra keyword arguments for WhoisCollector.
         '''
@@ -139,6 +164,40 @@ class ScanOrchestrator:
             **{**public_only, "timeout": max(config.timeout * 3, 30.0), "retries": max(config.retries, 3),
                "max_response_bytes": 25 * 1024 * 1024, "concurrency": 2},
             extra_headers={"Accept": "application/json"},
+        )
+        # One client per third-party family, each allow-listed to exactly the provider hosts its sources
+        # contact (never the target's scope, never private networks) — so a passive source cannot be
+        # steered into requesting anything else.
+        self.passive_sources = [passive_sources.REGISTRY[name]()
+                                for name in passive_sources.resolve_sources(config.subdomain_sources)]
+        self.passive_client = passive_client or self._source_client(
+            passive_sources.scope_hosts([s.name for s in self.passive_sources]))
+        self.historical_sources = [historical_sources.REGISTRY[name]()
+                                   for name in historical_sources.resolve_sources(
+                                       config.historical_sources or None)] if config.historical else []
+        self.historical_client = historical_client or self._source_client(
+            historical_sources.scope_hosts([s.name for s in self.historical_sources]))
+
+    def _source_client(self, hosts: list[str]) -> SafeHttpClient | None:
+        '''
+        Build a client allow-listed to exactly these third-party source hosts.
+
+        Returns None when no host is given, which is how "no source enabled" is represented: a collector
+        with no client skips every source rather than falling back to a wider scope.
+        Parameters:
+            hosts (list[str]): Provider hostnames the client may contact.
+        Returns:
+            SafeHttpClient | None: The scoped client, or None when there is nothing to contact.
+        '''
+        if not hosts:
+            return None
+        cfg = self.config
+        return SafeHttpClient(
+            Scope(hosts=hosts),
+            **{**self._client_kwargs, "allow_private_networks": False,
+               "timeout": max(cfg.timeout * 2, 20.0), "retries": max(cfg.retries, 1),
+               "max_response_bytes": 25 * 1024 * 1024, "concurrency": 2},
+            extra_headers={"Accept": "application/json, text/html;q=0.9, */*;q=0.8"},
         )
 
     def rdap_client_factory(self, scope: Scope) -> SafeHttpClient:
@@ -205,7 +264,11 @@ class ScanOrchestrator:
                                                     "max_response_bytes": cfg.max_source_map_bytes,
                                                     "concurrency": 4})
 
-        async with self.target_client, self.rdap_client, self.ct_client, asset_client, map_client:
+        async with AsyncExitStack() as stack:
+            for client in (self.target_client, self.rdap_client, self.ct_client, asset_client, map_client,
+                           self.passive_client, self.historical_client):
+                if client is not None:
+                    await stack.enter_async_context(client)
             dns_result = await self._maybe("dns", lambda: DnsCollector(host, self.dns_client, cfg.dkim_selectors))
             ips = dns_result.data.addresses() if dns_result.data else []
 
@@ -214,7 +277,7 @@ class ScanOrchestrator:
                                     allow_private_networks=cfg.allow_private_networks, **self.tls_kwargs).probe(hostname)
 
             (network_result, http_result, tls_result, whois_result, subdomains_result,
-             dnssec_result) = await asyncio.gather(
+             dnssec_result, historical_result) = await asyncio.gather(
                 self._maybe("network", lambda: NetworkCollector(ips, self.dns_client, self.rdap_client,
                                                                 self.geo_locator),
                             None if ips else "no A/AAAA addresses resolved"),
@@ -228,9 +291,16 @@ class ScanOrchestrator:
                     host, self.ct_client, self.dns_client, verify_limit=cfg.max_subdomains,
                     http_client=self.target_client if cfg.probe_subdomains else None,
                     tls_probe=tls_probe if cfg.probe_subdomains else None,
-                    cache=CtCache(cfg.cache_dir, timedelta(hours=cfg.ct_cache_ttl_hours)))),
+                    cache=CtCache(cfg.cache_dir, timedelta(hours=cfg.ct_cache_ttl_hours)),
+                    passive_client=self.passive_client, passive_sources=self.passive_sources,
+                    passive_cache=PassiveCache(cfg.cache_dir, timedelta(hours=cfg.ct_cache_ttl_hours)),
+                    permute=cfg.permute_subdomains, permutation_limit=cfg.max_permutations)),
                 self._maybe("dnssec", lambda: DnssecCollector(host, self.dnssec_client, timeout=cfg.timeout,
                                                               retries=cfg.retries)),
+                self._maybe("historical", lambda: HistoricalUrlCollector(
+                    host, self.historical_client, sources=self.historical_sources,
+                    limit=cfg.max_historical_urls),
+                    None if self.historical_sources else "no historical sources enabled"),
             )
 
             http = http_result.data
@@ -265,6 +335,14 @@ class ScanOrchestrator:
         third_party_result = await self._maybe("third_party", lambda: ThirdPartyCollector(
             host, dns=dns_result.data, http=http, html=html_result.data, tls=tls_result.data, crawl=crawl,
             assets=assets))
+        seo_result = await self._maybe("seo", lambda: SeoCollector(
+            host, origin, html=html_result.data, http=http, crawl=crawl, resources=resources_result.data),
+            None if (http or crawl) else "requires HTTP or crawl results")
+        if historical_result.data is not None and technology_result.data is not None:
+            # Annotate (never merge): a hint the current scan also detects is a live technology, while one
+            # only the archive saw is a lead about the past. The technology inventory itself is untouched.
+            HistoricalUrlCollector.mark_current(
+                historical_result.data, {t.name for t in technology_result.data.technologies})
 
         report = ReconReport(
             scan_id=ScanStore.new_scan_id(started),
@@ -276,7 +354,7 @@ class ScanOrchestrator:
             html=html_result, technology=technology_result, subdomains=subdomains_result,
             third_party=third_party_result, dnssec=dnssec_result, resources=resources_result,
             crawler=crawler_result, cookies=cookies_result, javascript=assets_result, render=render_result,
-            vulnscan=vulnscan_result,
+            vulnscan=vulnscan_result, historical=historical_result, seo=seo_result,
             analysis=AnalysisResult(),
             limitations=list(self.LIMITATIONS),
         )
@@ -287,7 +365,7 @@ class ScanOrchestrator:
             dnssec=dnssec_result.data, resources=resources_result.data, crawl=crawl,
             cookies=cookies_result.data, assets=assets, third_party=third_party_result.data,
             render=render_result.data, vulnerabilities=vulnscan_result.data,
-            observations=report.observations,
+            historical=historical_result.data, seo=seo_result.data, observations=report.observations,
         )
         report.errors = [e for m in report.module_results().values() for e in m.errors]
         report.finished_at = utcnow()
@@ -366,6 +444,11 @@ class ScanOrchestrator:
                 "crawl_depth": c.crawl_depth, "max_pages": c.max_pages, "crawl_delay": c.crawl_delay,
                 "respect_robots": c.respect_robots, "concurrency": c.concurrency, "max_assets": c.max_assets,
                 "asset_hosts": list(c.asset_hosts),
+                "subdomain_sources": [s.name for s in self.passive_sources],
+                "permute_subdomains": c.permute_subdomains, "max_permutations": c.max_permutations,
+                "historical": c.historical, "max_historical_urls": c.max_historical_urls,
+                "seo": c.seo,
+                "historical_sources": [s.name for s in self.historical_sources],
                 "format": c.output_format.value, "allow_private_networks": c.allow_private_networks,
                 "signatures_version": SIGNATURES_VERSION,
                 "geoip_db": str(c.geoip_db) if c.geoip_db else None}

@@ -130,10 +130,10 @@ async def test_json_and_markdown_reports(tmp_path, patched_collectors):
 
     names = sorted(p.relative_to(tmp_path).as_posix() for p in paths)
     assert names == sorted([f"example.com/raw/{m}.json" for m in report.module_results()] + ["example.com/report.json"])
-    assert len(report.module_results()) == 16
+    assert len(report.module_results()) == 18
 
     doc = json.loads((tmp_path / "example.com/report.json").read_text())
-    assert doc["schema_version"] == "2.3" and doc["scan_id"]
+    assert doc["schema_version"] == "2.5" and doc["scan_id"]
     assert doc["target"]["hostname"] == "example.com"
     assert doc["network"]["status"] == "failed" and doc["network"]["data"] is None
     assert "body" not in doc["http"]["data"]["probes"][0]   # raw bodies never serialized
@@ -141,7 +141,8 @@ async def test_json_and_markdown_reports(tmp_path, patched_collectors):
 
     md = md_path.read_text()
     for heading in ("Executive Summary", "DNS Reconnaissance", "Network and IP Intelligence",
-                    "Technology Fingerprinting", "Subdomain Discovery", "Third-Party Integrations",
+                    "Technology Fingerprinting", "Subdomain Discovery", "Historical URLs",
+                    "SEO Audit", "Third-Party Integrations", "Managed Cloud Resources",
                     "Security Observations", "Collection Errors and Limitations"):
         assert heading in md
     assert "refused \\| piped" in md                          # table cells escaped
@@ -160,7 +161,8 @@ async def test_html_report_contains_every_section_and_raw_data(tmp_path, patched
     page = path.read_text()
     assert path.name == "report.html" and page.startswith("<!doctype html>")
     for sid in ("summary", "findings", "dns", "network", "http", "tls", "whois", "technology", "html",
-                "subdomains", "third-party", "infrastructure", "errors", "raw", "sources"):
+                "subdomains", "historical", "seo", "third-party", "cloud", "infrastructure", "errors",
+                "raw", "sources"):
         assert f'<section id="{sid}">' in page
     for module in report.module_results():
         assert f"{module} <span class=\"muted\">(" in page       # raw JSON block per module
