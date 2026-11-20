@@ -15,12 +15,14 @@ from recon.models.cookies import CookieData
 from recon.models.crawl import CrawlData
 from recon.models.dns import DnsData
 from recon.models.dnssec import DnssecData
+from recon.models.historical import HistoricalData
 from recon.models.html import HtmlData
 from recon.models.http import HttpData
 from recon.models.network import NetworkData
 from recon.models.observations import ComparisonResult, Observation
 from recon.models.render import RenderData
 from recon.models.resources import ResourcesData
+from recon.models.seo import SeoData
 from recon.models.vulns import VulnerabilityData
 from recon.models.subdomains import SubdomainData
 from recon.models.technology import TechnologyData
@@ -29,9 +31,14 @@ from recon.models.tls import TlsData
 from recon.models.whois import DomainRegistration
 
 # 2.1 adds optional provenance/freshness fields to observations and a lifecycle `state` to findings.
-# 2.2 adds the optional `finding_changes` delta (new/persisting/resolved) since the previous scan. All are
-# additive with safe defaults, so reports written by older versions still load.
-SCHEMA_VERSION: str = "2.3"
+# 2.2 adds the optional `finding_changes` delta (new/persisting/resolved) since the previous scan.
+# 2.4 adds the `historical` module (archived URLs, parameters and old technology hints), non-CT passive
+# subdomain sources with their own per-source results, the permutation summary, and the managed-cloud
+# resource inventory on third_party.
+# 2.5 adds the `seo` module (per-page on-page facts and site-wide SEO aggregates) and the separately
+# computed `analysis.seo` audit (checks, per-area scores and an overall SEO grade). All are additive with
+# safe defaults, so reports written by older versions still load.
+SCHEMA_VERSION: str = "2.5"
 
 
 class Finding(BaseModel):
@@ -108,6 +115,50 @@ class SecurityGrade(BaseModel):
                  "It summarizes posture for trend tracking; it is not a pass/fail audit.")
 
 
+class SeoCheck(BaseModel):
+    '''
+    The outcome of one SEO check over the analyzed pages.
+
+    ``checked`` is how many pages (or site-level items) the check could actually evaluate and ``affected``
+    how many failed it, so a check is always reported with its own denominator. A check whose input is
+    missing is ``not_checked`` and scores nothing at all, rather than silently passing — an absent crawl
+    must not look like a clean result.
+    '''
+    id: str                       # check id, e.g. 'titles_missing' (finding code: 'seo.<id>')
+    label: str
+    area: str                     # indexability / metadata / content / crawlability / performance
+    status: str                   # pass, fail, not_checked
+    scope: str                    # page or site
+    affected: int = 0
+    checked: int = 0
+    weight: int = 0               # points this check can deduct from its area when every page fails
+    penalty: int = 0              # points actually deducted (weight x share affected)
+    samples: list[str] = Field(default_factory=list)   # a few affected pages/items, for the report
+    detail: str | None = None
+    note: str | None = None       # why a check was not evaluated
+
+
+class SeoGrade(BaseModel):
+    '''
+    An SEO health score with a per-area breakdown and the full check list behind it.
+
+    Deliberately separate from SecurityGrade: SEO issues are quality signals, not security posture, and
+    letting them move a security grade (or the reverse) would make both numbers meaningless. The score is
+    a relative, comparable number for tracking a site against itself over time — it is not a prediction of
+    rankings, which depend on factors no passive scan can see.
+    '''
+    score: int                    # 0-100 overall
+    grade: str                    # A+ ... F
+    areas: list[AreaGrade] = Field(default_factory=list)
+    checks: list[SeoCheck] = Field(default_factory=list)
+    pages_analyzed: int = 0
+    checks_version: str = ""
+    note: str = ("100 minus the weighted share of pages failing each check, averaged over the areas that "
+                 "could be evaluated. It tracks on-page SEO hygiene against this site's own history; it "
+                 "does not estimate search rankings or traffic, and areas with no evidence are excluded "
+                 "rather than assumed to pass.")
+
+
 class AnalysisResult(BaseModel):
     '''
     Output of the analysis engine.
@@ -116,6 +167,7 @@ class AnalysisResult(BaseModel):
     infrastructure: list[InfrastructureObservation] = Field(default_factory=list)
     severity_counts: dict[str, int] = Field(default_factory=dict)
     grade: SecurityGrade | None = None
+    seo: SeoGrade | None = None          # computed only when the seo module ran; never affects `grade`
 
 
 class FindingDelta(BaseModel):
@@ -199,6 +251,8 @@ class ReconReport(BaseModel):
     javascript: ModuleResult[AssetData] = Field(default_factory=_skipped("javascript"))
     render: ModuleResult[RenderData] = Field(default_factory=_skipped("render"))
     vulnscan: ModuleResult[VulnerabilityData] = Field(default_factory=_skipped("vulnscan"))
+    historical: ModuleResult[HistoricalData] = Field(default_factory=_skipped("historical"))
+    seo: ModuleResult[SeoData] = Field(default_factory=_skipped("seo"))
     observations: list[Observation] = Field(default_factory=list)
     analysis: AnalysisResult
     comparison: ComparisonResult | None = None    # observation-level changes since the previous stored scan
@@ -217,5 +271,5 @@ class ReconReport(BaseModel):
             "tls": self.tls, "whois": self.whois, "resources": self.resources, "crawler": self.crawler,
             "html": self.html, "javascript": self.javascript, "technology": self.technology, "cookies": self.cookies,
             "subdomains": self.subdomains, "third_party": self.third_party, "render": self.render,
-            "vulnscan": self.vulnscan,
+            "vulnscan": self.vulnscan, "historical": self.historical, "seo": self.seo,
         }

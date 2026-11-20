@@ -241,6 +241,7 @@ class Crawler(Collector[CrawlData]):
         page.response_time_ms = resp.elapsed_ms
         page.security_headers = {name: sh.value for name, sh in SecurityHeaderParser.inspect_all(headers).items()}
         page.cache_control = resp.header("cache-control")
+        page.x_robots_tag = resp.header("x-robots-tag")
         page.cors = SecurityHeaderParser.cors(headers)
         page.set_cookies = headers.get("set-cookie", [])
         if "html" not in (page.content_type or "").lower() or resp.status_code >= 400:

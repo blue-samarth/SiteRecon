@@ -11,6 +11,14 @@ from recon.modules.cookies import CookieCollector, CookieParser
 from recon.modules.crawler import Crawler, RobotsRules
 from recon.modules.dns import DnsCollector
 from recon.modules.dnssec import DnssecCollector
+from recon.modules.historical import (
+    CommonCrawlUrlSource,
+    HistoricalSource,
+    HistoricalUrlCollector,
+    OtxUrlSource,
+    UrlScanUrlSource,
+    WaybackUrlSource,
+)
 from recon.modules.html import HtmlCollector, HtmlParser
 from recon.modules.http import HttpCollector, SecurityHeaderParser
 from recon.modules.render import Renderer
@@ -34,13 +42,29 @@ from recon.modules.resources import (
     SecurityTxtParser,
     SitemapParser,
 )
+from recon.modules.seo import PageSeoParser, SeoCollector, normalize_url
+from recon.modules.sources import SourceError, fetch_json, fetch_json_lines, fetch_text, parse_timestamp
+from recon.modules.subdomain_sources import (
+    AlienVaultOtxSource,
+    AnubisSource,
+    BufferOverSource,
+    CommonCrawlSource,
+    HackerTargetSource,
+    PassiveSource,
+    RapidDnsSource,
+    UrlScanSource,
+    WaybackSource,
+)
 from recon.modules.subdomains import (
     CertSpotterProvider,
     CrtShProvider,
     CtCache,
     CtProvider,
     CtProviderError,
+    PassiveCache,
+    SourceCache,
     SubdomainCollector,
+    SubdomainPermuter,
 )
 from recon.modules.technology import FingerprintInputs, TechnologyCollector, TechnologyFingerprinter
 from recon.modules.third_party import ServiceInventory, ThirdPartyCollector
@@ -64,4 +88,13 @@ __all__ = [
     "AssetCollector", "BundleAnalyzer", "BundleSignature", "BUNDLE_SIGNATURES",
     "EndpointExtractor", "ClientConfigExtractor", "SecretScanner", "IntegrityVerifier",
     "SourceMapReader", "AssetRef",
+    # phase 1: passive discovery sources, permutation and historical URLs
+    "SourceError", "fetch_json", "fetch_json_lines", "fetch_text", "parse_timestamp",
+    "PassiveSource", "AlienVaultOtxSource", "UrlScanSource", "CommonCrawlSource", "WaybackSource",
+    "RapidDnsSource", "HackerTargetSource", "AnubisSource", "BufferOverSource",
+    "SourceCache", "PassiveCache", "SubdomainPermuter",
+    "HistoricalUrlCollector", "HistoricalSource", "WaybackUrlSource", "CommonCrawlUrlSource",
+    "UrlScanUrlSource", "OtxUrlSource",
+    # seo audit
+    "SeoCollector", "PageSeoParser", "normalize_url",
 ]

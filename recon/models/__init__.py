@@ -37,6 +37,13 @@ from recon.models.dns import (
     SpfRecord,
 )
 from recon.models.dnssec import DnssecData, DnssecStatus
+from recon.models.historical import (
+    HistoricalData,
+    HistoricalParameter,
+    HistoricalSourceResult,
+    HistoricalTechHint,
+    HistoricalUrl,
+)
 from recon.models.html import HtmlData, ResourceRef
 from recon.models.http import HttpData, HttpHop, HttpProbe, SecurityHeader
 from recon.models.network import AsnInfo, GeoLocation, IpIntel, NetworkData, RdapNetwork
@@ -55,6 +62,8 @@ from recon.models.report import (
     AnalysisResult,
     AreaGrade,
     SecurityGrade,
+    SeoCheck,
+    SeoGrade,
     Finding,
     FindingDelta,
     InfrastructureObservation,
@@ -62,9 +71,27 @@ from recon.models.report import (
     TargetInfo,
     ToolInfo,
 )
-from recon.models.subdomains import CtEntry, HostState, ProviderResult, SubdomainData, SubdomainRecord
+from recon.models.seo import (
+    BrokenLink,
+    DuplicateGroup,
+    HostCanonical,
+    PageSeo,
+    RedirectRecord,
+    SeoData,
+    SitemapAudit,
+)
+from recon.models.subdomains import (
+    CtEntry,
+    HostState,
+    PassiveEntry,
+    PermutationStats,
+    ProviderResult,
+    SourceKind,
+    SubdomainData,
+    SubdomainRecord,
+)
 from recon.models.technology import DetectionStatus, TechEvidence, Technology, TechnologyData
-from recon.models.third_party import ThirdPartyData, ThirdPartyService
+from recon.models.third_party import CloudResource, ThirdPartyData, ThirdPartyService
 from recon.models.tls import CertificateInfo, TlsData, TlsProbe
 from recon.models.whois import DomainRegistration
 
@@ -94,4 +121,10 @@ __all__ = [
     "AssetData", "AssetRecord", "LibraryHit", "SkippedAsset", "EndpointRef", "ClientConfig",
     "ClientConfigValue", "SecretFinding", "RenderData", "RenderRequest", "RenderedPage",
     "VulnerabilityData", "VulnerableComponent", "VulnMatch",
+    # phase 1 passive enrichment
+    "PassiveEntry", "PermutationStats", "SourceKind", "CloudResource",
+    "HistoricalData", "HistoricalParameter", "HistoricalSourceResult", "HistoricalTechHint", "HistoricalUrl",
+    # seo audit
+    "SeoData", "PageSeo", "DuplicateGroup", "BrokenLink", "RedirectRecord", "SitemapAudit", "HostCanonical",
+    "SeoCheck", "SeoGrade",
 ]
