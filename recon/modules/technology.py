@@ -18,6 +18,7 @@ Grading: *confirmed* with any high-strength evidence or two independent source t
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -233,37 +234,77 @@ class TechnologyFingerprinter:
         if version and not tech.version:
             tech.version = version
 
-    @staticmethod
-    def _grade(tech: Technology) -> None:
+    # Evidence sources that only say a technology is *permitted or delivered*, not that it is used: a CSP
+    # allow-list entry, a CNAME delivery hint, or an implication from another detection. Two of these
+    # together are still weak, so they can never corroborate each other into a confirmed detection.
+    WEAK_SOURCES: ClassVar[frozenset[str]] = frozenset({"csp", "dns", "implied"})
+
+    @classmethod
+    def _grade(cls, tech: Technology) -> None:
         '''
-        Set status and confidence: confirmed (high evidence or two independent sources),
-        probable (a medium signal) or possible (only low-strength signals).
+        Set status and confidence from the evidence actually collected.
+
+        The ladder, strongest first:
+          * **confirmed** — at least one high-strength signal (the server or page states it), or two
+            independent *non-weak* sources agreeing (e.g. a resource URL and an HTML marker).
+          * **probable** — a single medium signal, or several weak ones pointing the same way.
+          * **possible** — only weak signals: CSP allow-listing, a DNS delivery hint, or an implication.
+
+        Weak sources never corroborate into *confirmed*: a CSP entry plus a CNAME means the technology is
+        permitted and perhaps delivered, which is not evidence the page uses it. A detection raised by
+        corroboration is capped at the strength corroboration actually earns, so a version from a weak
+        signal never comes back as confirmed fact.
         Parameters:
             tech (Technology): Detection to grade in place.
         '''
         strengths = [e.confidence for e in tech.evidence]
-        sources = {e.source for e in tech.evidence if e.source != "implied"}
+        sources = {e.source for e in tech.evidence}
+        strong_sources = sources - cls.WEAK_SOURCES
         tech.confidence = max(strengths, key=lambda c: c.rank)
-        if Confidence.HIGH in strengths or len(sources) >= 2:
+        corroborated = len(strong_sources) >= 2
+        if Confidence.HIGH in strengths or corroborated:
             tech.status = DetectionStatus.CONFIRMED
-            if len(sources) >= 2 and tech.confidence is not Confidence.HIGH:
-                tech.confidence = Confidence.HIGH if tech.confidence is Confidence.MEDIUM else Confidence.MEDIUM
+            if corroborated and tech.confidence is Confidence.MEDIUM:
+                tech.confidence = Confidence.HIGH
         elif Confidence.MEDIUM in strengths:
             tech.status = DetectionStatus.PROBABLE
+        elif len(sources) >= 2:
+            # Several weak signals agree (e.g. CSP-allowed and a matching CNAME): more than one guess,
+            # still not evidence of use.
+            tech.status = DetectionStatus.PROBABLE
+            tech.confidence = Confidence.LOW
         else:
             tech.status = DetectionStatus.POSSIBLE
 
-    # Versioned asset paths: '/npm/pkg@1.2.3/', '/ajax/libs/pkg/1.2.3/', 'pkg-1.2.3.min.js', 'pkg.1.2.3.js'
+    # Versioned asset paths, most explicit first:
+    #   '/npm/pkg@1.2.3/', '/ajax/libs/pkg/1.2.3/', 'pkg-1.2.3.min.js', 'pkg.1.2.3.js',
+    #   'pkg/dist/js/pkg.js?ver=1.2.3' (the WordPress/Drupal asset-versioning convention),
+    #   '/pkg/releases/1.2.3/', '/pkg_v1.2.3/'
     _URL_VERSION: ClassVar[tuple[str, ...]] = (
         r"[/@]{slug}@v?(?P<version>\d+\.\d+(?:\.\d+)?)",
-        r"/{slug}/v?(?P<version>\d+\.\d+(?:\.\d+)?)/",
+        r"/{slug}/(?:releases?/)?v?(?P<version>\d+\.\d+(?:\.\d+)?)/",
         r"{slug}[-.@_]v?(?P<version>\d+\.\d+(?:\.\d+)?)(?:[-.]|\.min|\.js|\.css|$)",
+        r"{slug}[^?]*\?(?:[^&]*&)*ver(?:sion)?=v?(?P<version>\d+\.\d+(?:\.\d+)?)",
     )
+    # A generic '?ver=' on any asset of a versioned CMS states the *platform* version, not a library's.
+    _PLATFORM_VERSION_QUERY: ClassVar[re.Pattern[str]] = re.compile(
+        r"\?(?:[^&]*&)*ver(?:sion)?=v?(?P<version>\d+\.\d+(?:\.\d+)?)", re.IGNORECASE)
+    # Technologies whose asset URLs carry the platform version in '?ver=' (WordPress and friends).
+    _PLATFORM_ASSET_PATHS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "WordPress": (r"/wp-includes/", r"/wp-content/"),
+        "Drupal": (r"/core/misc/", r"/sites/all/modules/", r"/core/modules/"),
+        "Joomla": (r"/media/system/js/",),
+    }
 
     @classmethod
     def _version_from_urls(cls, name: str, urls: list[str]) -> str | None:
         '''
-        Recover a version from a versioned asset path (CDN or filename) for a detected technology.
+        Recover a version for a detected technology from a versioned asset path.
+
+        Only a path that *states* a version counts — a CDN package path, a versioned filename, or an asset
+        query parameter — so a version is never guessed from a hash, a date or a chunk name. For a
+        versioned CMS the platform's own asset paths are checked too, which is how ``?ver=6.4.2`` on a
+        ``/wp-includes/`` script recovers the WordPress version the banner no longer discloses.
         Parameters:
             name (str): Technology name, e.g. 'jQuery'.
             urls (list[str]): Referenced resource URLs.
@@ -281,9 +322,29 @@ class TechnologyFingerprinter:
             for variant in dict.fromkeys(variants):
                 pattern = template.replace("{slug}", variant)
                 for url in urls:
-                    if m := re.search(pattern, url, re.I):
+                    if m := re.search(pattern, url, re.IGNORECASE):
                         return m.group("version")
-        return None
+        return cls._platform_version(name, urls)
+
+    @classmethod
+    def _platform_version(cls, name: str, urls: list[str]) -> str | None:
+        '''
+        Recover a CMS platform version from the '?ver=' query on one of its own asset paths.
+        Parameters:
+            name (str): Technology name.
+            urls (list[str]): Referenced resource URLs.
+        Returns:
+            str | None: The most common stated version, or None.
+        '''
+        paths = cls._PLATFORM_ASSET_PATHS.get(name)
+        if not paths:
+            return None
+        seen: Counter[str] = Counter()
+        for url in urls:
+            if any(re.search(p, url, re.IGNORECASE) for p in paths) and (
+                    m := cls._PLATFORM_VERSION_QUERY.search(url)):
+                seen[m.group("version")] += 1
+        return seen.most_common(1)[0][0] if seen else None
 
     @staticmethod
     def _version(match: re.Match[str]) -> str | None:

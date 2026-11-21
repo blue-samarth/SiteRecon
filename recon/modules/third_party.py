@@ -5,6 +5,11 @@ Confidence by source:
   loaded resource (script/stylesheet/image/iframe), MX, NS, cert issuer → high
   preconnect / dns-prefetch, SPF include, TXT verification, redirect     → medium
   CSP allow-list only, unrecognized domain via weak source               → low
+
+The same evidence also yields a **managed-cloud inventory**: buckets, serverless functions, managed
+databases, edge workers and hosting targets the application references (see
+``recon/analysis/cloud_signatures.py``). That inventory records references only — nothing is requested, so
+it never claims a bucket is readable or a function is unauthenticated.
 '''
 
 from __future__ import annotations
@@ -20,8 +25,10 @@ from recon.analysis import (
     TXT_VERIFICATIONS,
     DomainService,
 )
+from recon.analysis.cloud_signatures import match_cloud
 from recon.models import (
     AssetData,
+    CloudResource,
     CollectionError,
     Confidence,
     CrawlData,
@@ -34,7 +41,7 @@ from recon.models import (
 )
 from recon.modules.base import Collector
 from recon.modules.http import SecurityHeaderParser
-from recon.utils import Scope, host_of, matches_suffix, registrable_domain
+from recon.utils import Scope, host_of, matches_suffix, redact_url, registrable_domain
 
 
 class ServiceInventory:
@@ -152,7 +159,7 @@ class ThirdPartyCollector(Collector[ThirdPartyData]):
         '''
         Run every evidence source into a fresh inventory.
         Returns:
-            ThirdPartyData: Services sorted with recognized providers first.
+            ThirdPartyData: Services sorted with recognized providers first, plus the cloud inventory.
         '''
         inv = ServiceInventory()
         if self.html:
@@ -170,7 +177,89 @@ class ThirdPartyCollector(Collector[ThirdPartyData]):
             self._from_dns(self.dns, inv)
         if self.tls:
             self._from_tls(self.tls, inv)
-        return ThirdPartyData(services=inv.services())
+        return ThirdPartyData(services=inv.services(), cloud_resources=self.cloud_resources())
+
+    def cloud_resources(self) -> list[CloudResource]:
+        '''
+        Build the managed-cloud inventory from every reference the scan already holds.
+
+        Candidate references come from page and crawl resources, bundle-referenced hosts and endpoint URLs,
+        CNAME targets and the CSP allow-list. A hostname inside the target's own scope is still matched —
+        a bucket the operator fronted with their own CNAME is exactly the kind of resource worth listing —
+        but nothing is requested, so each entry means "referenced", never "reachable" or "public".
+        Returns:
+            list[CloudResource]: Resources, object storage and functions first, then by provider.
+        '''
+        resources: dict[tuple[str, str, str], CloudResource] = {}
+        for url, host, source, evidence, confidence in self._cloud_candidates():
+            matched = match_cloud(host, url)
+            if matched is None:
+                continue
+            sig = matched.signature
+            key = (sig.provider, sig.kind, matched.identifier)
+            resource = resources.get(key)
+            if resource is None:
+                resource = CloudResource(
+                    provider=sig.provider, kind=sig.kind, identifier=matched.identifier, host=matched.host,
+                    region=matched.region, confidence=confidence,
+                    public_by_default=sig.public_by_default, note=sig.note or None,
+                    url_sample=redact_url(url) if url else None)
+                resources[key] = resource
+            if source not in resource.sources:
+                resource.sources.append(source)
+            if evidence not in resource.evidence and len(resource.evidence) < 8:
+                resource.evidence.append(evidence)
+            if resource.url_sample is None and url:
+                resource.url_sample = redact_url(url)
+            if resource.region is None and matched.region:
+                resource.region = matched.region
+            if confidence.rank > resource.confidence.rank:
+                resource.confidence = confidence
+        order = {"object_storage": 0, "serverless_function": 1, "managed_database": 2, "edge_worker": 3,
+                 "auth": 4, "search": 5, "container": 6, "hosting": 7}
+        return sorted(resources.values(),
+                      key=lambda r: (order.get(r.kind, 9), r.provider, r.identifier))
+
+    def _cloud_candidates(self) -> list[tuple[str, str, str, str, Confidence]]:
+        '''
+        Every (url, host, source, evidence, confidence) reference worth testing against the cloud patterns.
+
+        Confidence mirrors the rest of this module: a resource the page or a bundle actually loads or calls
+        is HIGH, a DNS delegation is MEDIUM (it proves delivery, not ownership of the content), and a host
+        that is merely CSP-allowed is LOW (permitted, not necessarily used).
+        Returns:
+            list[tuple[str, str, str, str, Confidence]]: Candidate references.
+        '''
+        out: list[tuple[str, str, str, str, Confidence]] = []
+
+        def offer(url: str, host: str | None, source: str, evidence: str, confidence: Confidence) -> None:
+            if host:
+                out.append((url, host, source, evidence[:200], confidence))
+
+        for ref in (self.html.resources if self.html else []):
+            offer(ref.url, ref.host, f"html:{ref.kind}", f"{ref.kind} {redact_url(ref.url)[:150]}",
+                  Confidence.HIGH if ref.kind in self.LOADED_KINDS else Confidence.MEDIUM)
+        for page in (self.crawl.pages if self.crawl else []):
+            for url in page.resource_urls:
+                offer(url, host_of(url), "crawl", f"{page.url}: {redact_url(url)[:150]}", Confidence.HIGH)
+        if self.assets:
+            for host, refs in self.assets.service_hosts.items():
+                offer("", host, "bundle", f"referenced in {refs[0]}", Confidence.MEDIUM)
+            for endpoint in self.assets.endpoints():
+                if endpoint.host and "//" in endpoint.value:
+                    offer(endpoint.value, endpoint.host, "bundle:endpoint",
+                          f"endpoint {endpoint.value[:150]}", Confidence.HIGH)
+        for probe in (self.http.probes if self.http else []):
+            csp = probe.security_headers.get("content-security-policy")
+            if csp and isinstance(csp.parsed, dict):
+                for allowed in SecurityHeaderParser.csp_hosts(csp.parsed):
+                    offer("", allowed, "csp", f"CSP allows {allowed}", Confidence.LOW)
+        for key in ("CNAME", "CNAME(www)"):
+            query = self.dns.queries.get(key) if self.dns else None
+            for value in (query.values if query else []):
+                target = value.rstrip(".").lower()
+                offer("", target, "dns:cname", f"{key} → {target}", Confidence.MEDIUM)
+        return out
 
     def _from_html(self, html: HtmlData, inv: ServiceInventory) -> None:
         '''

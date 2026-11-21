@@ -18,11 +18,18 @@ the next, not-yet-started frontier.
 | **3** | Active-testing framework & core checks | Authorization gate (scope, window, rate/budget), `ActiveContext`, check registry; `backend_read_access` (ex-`supabase_rls`), `function_url_reachability`, `client_ip_header_trust`, `email_endpoint_rate_limit`, `tls_protocol_enum` | ✅ shipped (PR #1) |
 | **4** | External intelligence | Keyless providers (Wayback, Shodan InternetDB); hosting/geolocation inference; provider-aware freshness | ✅ shipped |
 | **5** | Active network recon, auto-discovery & regression | `port_scan`, `traceroute`; `--bypass-sec` + auto-discovery of effective authorization; cross-scan `FindingDelta` and `regression.*` findings; cross-module correlation; confidence calibration; CI gates (`--fail-on`, `--fail-on-new`) | ✅ shipped (PR #2) **← current** |
+| **5.5** | Passive data enrichment | Passive subdomain sources (OTX, urlscan, Common Crawl, Wayback, RapidDNS, HackerTarget, Anubis, BufferOver) with per-source outcomes and caching; controlled DNS-confirmed permutation; historical-URL module (archived endpoints, parameters, legacy-stack hints); 541 technology signatures with weak-source-aware grading and `?ver=` version recovery; managed-cloud inventory and findings | ✅ shipped (schema **2.4**) |
+| **5.6** | On-page SEO audit | `seo` module deriving per-page SEO facts from pages already fetched (indexability, metadata, heading outline, word count, alt coverage, link graph, structured data); site-wide aggregates (duplicate titles/descriptions/H1s, orphans, broken internal links, redirects, sitemap-vs-robots-vs-crawl coverage, apex/www canonicalization, delivery); a 39-entry declarative check table driving both findings and a separate A–F SEO grade with `not_checked` states and proportional deductions | ✅ shipped (schema **2.5**) |
 | **6** | Dynamic rendering & deep testing | Headless-browser rendering (Playwright) to capture runtime DOM/endpoints and close the SPA gap; authenticated/session testing; business-logic probing | ⛔ not started |
 
-**Where we are:** Phase 5 is complete (merged as PR #2) — the most recent work
-is a code-review pass on top of it (regression-handler fixes, finding-state
-re-derivation, port-scan/traceroute/intel-budget hardening, ruff/mypy config).
+**Where we are:** Phase 5 is complete (merged as PR #2), followed by a code-review
+pass (regression-handler fixes, finding-state re-derivation,
+port-scan/traceroute/intel-budget hardening, ruff/mypy config) and then the
+passive data-enrichment work in the table above (see
+`docs/passive-discovery.md`, and **Follow-up for later phases** at the end of
+this file). Phase 5.6 added the on-page SEO audit behind `--seo` (see
+`docs/seo.md`): a second, deliberately separate graded dimension alongside the
+security grade, derived from the pages a scan already fetched.
 The Phase 6 frontier (Playwright-based dynamic rendering, authenticated and
 business-logic testing) is designed-but-deferred; see **Deferred beyond v0.3.0**
 at the end of this file. Today, JavaScript is analysed statically (parsed, never
@@ -328,3 +335,106 @@ target-specific testing that phase would also open up:
   target-specific.
 - Resume/file-upload fuzzing (type validation, malware, stored-content
   rendering) — needs a sandboxed analysis pipeline beyond this tool's scope.
+
+---
+
+# Passive data enrichment — what shipped, and what it leaves open
+
+Shipped (schema **2.4**, documented in `docs/passive-discovery.md`):
+
+- **Passive subdomain sources.** Eight sources behind `--subdomain-source` (OTX, urlscan.io, Common Crawl,
+  Wayback, RapidDNS, HackerTarget, Anubis-DB, and key-gated BufferOver), each with its own allow-listed
+  client, per-source outcome row, cache fallback and `SourceKind` so a hit's evidential weight is explicit.
+  Off by default: every source discloses the target domain to another provider.
+- **Controlled permutation.** `--permute-subdomains` generates candidates from observed labels plus a small
+  fixed wordlist, scope-checks every one, resolves A/AAAA only, hard-caps the count, and keeps a name only
+  when it resolves. Produces `subdomains.unlisted_host` for resolving names absent from every public dataset.
+- **Historical URLs.** A new `historical` module (`--historical`) over Wayback, Common Crawl, urlscan.io and
+  OTX, extracting the archived endpoint surface, query-parameter classes (values redacted), technology
+  hints with first/last-seen windows, and sensitive-looking paths.
+- **Technology detection.** 87 → 541 signatures across 45 categories; grading now refuses to let two weak
+  signals (CSP allow-listing, a CNAME hint, an implication) corroborate into *confirmed*; version recovery
+  added for asset `?ver=` queries, including CMS platform versions the generator tag no longer discloses.
+  WAF signatures roughly tripled (AWS WAF, Cloud Armor, FortiWeb, NetScaler, Radware, Reblaze, DDoS-Guard,
+  Qrator, Wallarm, SafeLine, Alibaba, Tencent, and more), each still distinguishing "proxy present" from
+  "WAF rules enabled".
+- **Managed-cloud inventory.** `recon/analysis/cloud_signatures.py` classifies ~90 patterns into object
+  storage, serverless functions, managed databases, edge workers, hosting, auth, search and container
+  registries, recovering the resource identifier and region from either addressing style and separating
+  same-host roles by path. Findings are scoped to what a *reference* justifies, and point at the active
+  checks for confirmation.
+
+# On-page SEO audit — what shipped
+
+`--seo` adds an eighteenth module, `seo`, and a second graded dimension. It is **derived**: it re-reads the
+response bodies the `http` and `crawler` modules retained, sends no requests of its own, contacts no third
+party and queries no search engine. Because a site-wide audit needs more than one page to compare, `--seo`
+turns the crawler on (announced on stdout, overridable with `--no-crawl`).
+
+The design decision worth recording is that **every judgement lives in one declarative table**
+(`recon/analysis/seo_checks.py`, 39 `SeoCheckSpec` entries). The same entry produces the finding
+(`seo.<id>`, with its recommendation from the central table) and the score deduction, so the two can never
+disagree, and a new check is one table entry plus one recommendation.
+
+Three rules keep the score from overstating what was observed:
+
+1. **`not_checked` is not a pass.** A check whose inputs are missing produces no finding, deducts nothing,
+   and its area is excluded from the overall average rather than credited as 100. A landing-page-only run
+   therefore cannot grade as a clean site; its report lists each skipped check and why.
+2. **Deductions are proportional.** `weight × (failing pages / evaluated pages)`, so one odd page and a
+   site-wide template bug are not the same cost.
+3. **The audit's own coverage is a finding.** `seo.coverage_single_page` and `seo.coverage_truncated` state
+   when the numbers describe one page or a truncated crawl.
+
+The SEO grade is deliberately separate from the security grade, and `recon/analysis/grading.py` now excludes
+the `seo` and `social` categories from the security score entirely. Before this change those findings fell
+through to the security grade's "exposure" area, so a missing canonical deducted from a *security* number —
+which is fixed here as part of the work.
+
+Two bugs in the new code were found by its own tests and are worth remembering, since both are easy to
+reintroduce: extracting `script` elements to exclude them from a word count destroyed any JSON-LD living in
+`<body>` before the structured-data inventory could read it (text nodes are now filtered, not removed); and
+building a sitemap audit even when the `resources` module had not run reported "no robots.txt" for a file
+that was never fetched (the audit is now `None`, so the check reports `not_checked`).
+
+## Follow-up for later phases
+
+Deliberately not attempted here, in rough priority order:
+
+1. **Active confirmation of the cloud inventory.** The passive layer now produces a precise list of buckets,
+   function endpoints and backend endpoints, each with its identifier. The existing `backend_read_access`
+   and `function_url_reachability` checks could consume that inventory directly (via
+   `recon/active/inventory.py`) instead of the operator copying hosts into the authorization file by hand —
+   with the same per-host opt-in, since auto-expanding active scope from recon findings is explicitly
+   against the Phase 3 design.
+2. **Reachability triage for archived endpoints.** `historical.endpoints` lists paths that were once
+   fetchable. Confirming which still respond is a bounded GET per path against the target — passive by
+   SiteRecon's own definition, but it multiplies request volume, so it needs its own flag, cap and
+   robots handling before it ships.
+3. **Key-gated discovery sources.** SecurityTrails, Censys, VirusTotal, Chaos, Netlas, FOFA, Shodan DNS and
+   Facebook CT all fit the existing `PassiveSource` interface (`key_env` / `key_header` are already in the
+   base class) and would lift coverage substantially. Each needs a credential story — environment variable
+   today, which does not scale to a dozen providers; a keyfile with per-source entries would.
+4. **Wordlist-based permutation.** The current wordlist is intentionally ~130 words. A larger list (or an
+   alterations file in the style of altdns) would find more, but changes the traffic profile enough that it
+   belongs behind its own flag with its own rate limiting, and arguably in the `active` command.
+5. **Signature-set maintenance.** 541 hand-curated signatures will drift. Options: import and transform
+   Wappalyzer's dataset at build time (licence review needed), or add a test that samples a corpus of real
+   pages and reports signatures that never fire. The `SIGNATURES_VERSION` field already records which set
+   produced a scan's detections, so a drift report is straightforward to add.
+6. **Historical URL volume.** Archived URLs are summarized into observations rather than recorded
+   individually, because a per-URL diff would bury real changes. If per-URL history is ever wanted, it
+   needs its own storage shape (an append-only URL ledger per target) rather than the observation table.
+7. **SEO over the rendered DOM.** Word counts, headings and metadata come from the HTML as served, so a
+   client-rendered page legitimately looks thin. `RenderData` already holds post-JavaScript pages from
+   `--render`; feeding those bodies to `PageSeoParser` (and labelling each page record with which view it
+   came from) would close the SPA gap for the audit the same way Phase 6 closes it for technology detection.
+8. **Real performance signals.** The delivery area scores server response time, compression, HTTP version
+   and markup weight — all honest, none of them user-perceived. Core Web Vitals need a real browser, so
+   they belong with the Phase 6 render work, not here, and must stay labelled as lab measurements.
+9. **Internal-link graph beyond the crawl.** Orphan detection is bounded by what was crawled, so a page
+   linked only from an uncrawled page is indistinguishable from a real orphan. Storing the link graph in
+   history and accumulating it across scans would sharpen this without more traffic per scan.
+10. **Cloud resource ownership.** The inventory cannot tell a bucket the target owns from a third party's
+   bucket it merely links to. RDAP/ASN correlation or an operator-supplied owned-resource list would
+   sharpen the distinction, which matters before any of this drives an active check.

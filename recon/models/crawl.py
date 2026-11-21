@@ -34,6 +34,9 @@ class CrawledPage(BaseModel):
     query_params: list[str] = Field(default_factory=list)
     security_headers: dict[str, str | None] = Field(default_factory=dict)
     cache_control: str | None = None
+    # Indexing directive sent as a response header; the SEO module needs it per page, since a header can
+    # block a URL from indexing with nothing in its markup to show it.
+    x_robots_tag: str | None = None
     cors: dict[str, str] = Field(default_factory=dict)
     resource_urls: list[str] = Field(default_factory=list)
     external_domains: list[str] = Field(default_factory=list)
