@@ -46,9 +46,9 @@ def _dns(transport=None, caa_records=()):
                    caa=CaaAnalysis(records=list(caa_records), complete=True))
 
 
-def _codes(dns, subdomains=None):
+def _codes(dns, subdomains=None, resources=None):
     f = FindingCollector(T0)
-    AnalysisEngine._analyze_email_transport(dns, f)
+    AnalysisEngine._analyze_email_transport(dns, resources, f)
     AnalysisEngine._analyze_caa_ct_mismatch(dns, subdomains, None, f)
     return {x.id.split(":", 1)[0] for x in f.sorted()}
 

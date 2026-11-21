@@ -8,9 +8,10 @@ import asyncio
 from typing import Any, ClassVar
 from urllib.parse import urljoin, urlsplit
 
-from recon.models import CollectionError, HttpData, HttpHop, HttpProbe, SecurityHeader
+from recon.models import CollectionError, HstsPreload, HttpData, HttpHop, HttpProbe, SecurityHeader
 from recon.modules.base import Collector
 from recon.utils import REDIRECT_STATUSES, FetchOutcome, RawResponse, SafeHttpClient, host_of
+from recon.utils.hsts import preload_status as lookup_preload
 
 
 class SecurityHeaderParser:
@@ -232,7 +233,30 @@ class HttpCollector(Collector[HttpData]):
         outcomes = await asyncio.gather(*(self.client.fetch(u) for u in self.candidate_urls(self.hostname)))
         probes = [self.build_probe(o) for o in outcomes]
         errors = [self.error(p.requested_url, p.error_type or "error", p.error or "") for p in probes if p.error]
-        return HttpData(probes=probes), errors
+        return HttpData(probes=probes, hsts_preload=self.preload_status(self.hostname)), errors
+
+    @staticmethod
+    def preload_status(hostname: str) -> HstsPreload:
+        '''
+        Look the hostname up in the bundled HSTS preload snapshot.
+
+        A local dataset read, not a request: it answers "would a browser upgrade this before even asking
+        the site" without disclosing the target to hstspreload.org. When no snapshot is available the
+        result is ``checked=False`` with the reason, so the analysis reports "not checked" instead of
+        treating an unreadable file as proof the domain is absent from the list.
+        Parameters:
+            hostname (str): Normalized target hostname.
+        Returns:
+            HstsPreload: The lookup result.
+        '''
+        status = lookup_preload(hostname)
+        if status is None:
+            return HstsPreload(checked=False, hostname=hostname,
+                               note="no usable HSTS preload snapshot is bundled with this installation; "
+                                    "refresh it with scripts/refresh_hsts_preload.py")
+        return HstsPreload(checked=True, preloaded=status.preloaded, hostname=hostname,
+                           matched_name=status.matched_name, via_subdomains=status.via_subdomains,
+                           snapshot_date=status.snapshot_date, entries=status.entries)
 
     @classmethod
     def build_probe(cls, outcome: FetchOutcome) -> HttpProbe:

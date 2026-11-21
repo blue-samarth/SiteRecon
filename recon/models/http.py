@@ -62,8 +62,28 @@ class HttpProbe(BaseModel):
     set_cookies: list[str] = Field(default_factory=list, exclude=True, repr=False)  # raw; values never reported
 
 
+class HstsPreload(BaseModel):
+    '''
+    Whether the target is in the browsers' HSTS preload list, from the bundled snapshot.
+
+    This is a lookup in a local dataset, not an observation of the site: a preloaded domain is upgraded
+    by the browser whatever its current header says, which is why membership and header eligibility are
+    recorded as two separate facts. ``checked`` is False when no snapshot was available, so "unknown" is
+    never collapsed into "not preloaded".
+    '''
+    checked: bool = False
+    preloaded: bool = False
+    hostname: str | None = None          # the name that was looked up
+    matched_name: str | None = None      # the list entry that covered it
+    via_subdomains: bool = False         # covered by an ancestor entry rather than its own
+    snapshot_date: str | None = None     # retrieval date of the bundled list
+    entries: int = 0                     # entries in the snapshot the answer came from
+    note: str | None = None              # why the lookup could not be performed
+
+
 class HttpData(BaseModel):
     '''
     All HTTP/HTTPS probes for the target.
     '''
     probes: list[HttpProbe] = Field(default_factory=list)
+    hsts_preload: HstsPreload | None = None

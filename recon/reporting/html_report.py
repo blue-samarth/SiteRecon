@@ -382,12 +382,32 @@ class HtmlReportWriter(ReportWriter):
                                      json.dumps(h.parsed, ensure_ascii=False) if h.parsed else None)
                                     for h in p.security_headers.values()])
             headers = self._table(["Header", "Value(s)"], [(k, v) for k, v in sorted(p.headers.items())])
+            fields += self._preload_row()
             out.append(f'<details open><summary>{label} {self._code(p.requested_url)} → '
                        f'{self._e(p.status_code)} {self._code(p.final_url or "")}</summary>'
                        f"<h4>Redirect chain</h4>{chain}<h4>Response</h4>{fields}"
                        f"<h4>Security headers</h4>{security}<details><summary>All response headers "
                        f"({len(p.headers)})</summary>{headers}</details></details>")
         return "".join(out)
+
+    def _preload_row(self) -> str:
+        '''
+        Render HSTS preload-list membership, which no response header can show.
+        Returns:
+            str: Safe HTML (empty when the lookup did not run).
+        '''
+        pre = self.report.http.data.hsts_preload if self.report.http.data else None
+        if pre is None:
+            return ""
+        if not pre.checked:
+            return self._note(f"HSTS preload list: not checked — {pre.note or 'no snapshot available'}.")
+        if pre.preloaded:
+            how = (f"covered by the entry for {pre.matched_name}" if pre.via_subdomains
+                   else f"listed as {pre.matched_name}")
+            return self._kv([("HSTS preload list", self._pill("preloaded", "ok")), ("Coverage", how),
+                             ("Snapshot", f"{pre.snapshot_date or 'undated'} · {pre.entries:,} entries")])
+        return self._kv([("HSTS preload list", self._pill("not listed", "skipped")),
+                         ("Snapshot", f"{pre.snapshot_date or 'undated'} · {pre.entries:,} entries")])
 
     def _tls(self) -> str:
         '''
@@ -560,7 +580,7 @@ class HtmlReportWriter(ReportWriter):
 
     def _resources(self) -> str:
         '''
-        Render robots.txt, sitemaps, security.txt, manifest, favicon and humans.txt.
+        Render robots.txt, sitemaps, security.txt, manifest, favicon, humans.txt and the MTA-STS policy.
         Returns:
             str: Section body.
         '''
@@ -576,7 +596,9 @@ class HtmlReportWriter(ReportWriter):
             return self._pill(res.error or f"absent (HTTP {res.status_code})", "skipped")
 
         items = [("robots.txt", d.robots), ("security.txt", d.security_txt), ("manifest", d.manifest),
-                 ("favicon", d.favicon), ("humans.txt", d.humans), *((f"sitemap ({s.source})", s) for s in d.sitemaps)]
+                 ("favicon", d.favicon), ("humans.txt", d.humans),
+                 *([("mta-sts.txt", d.mta_sts)] if d.mta_sts and d.mta_sts.not_applicable is None else []),
+                 *((f"sitemap ({s.source})", s) for s in d.sitemaps)]
         out = self._table(["Resource", "URL", "State", "Type", "Size", "SHA-256"],
                           [(name, r.url, state(r), r.content_type, r.size, self._code(r.sha256) if r.sha256 else None)
                            for name, r in items if r is not None])
@@ -594,6 +616,21 @@ class HtmlReportWriter(ReportWriter):
             out += "<h3>Web app manifest</h3>" + self._kv([
                 ("Name", m.name), ("Short name", m.short_name), ("Start URL", m.start_url), ("Scope", m.scope),
                 ("Display", m.display), ("Theme color", m.theme_color), ("Icons", m.icon_count)])
+        if (mta := d.mta_sts) is not None:
+            out += "<h3>MTA-STS policy</h3>"
+            if mta.not_applicable:
+                out += self._note(f"Not fetched — {mta.not_applicable}.")
+            else:
+                enforcing = (self._pill("enforcing", "ok") if mta.mode == "enforce"
+                             else self._pill(mta.mode or "not parsed", "partial"))
+                out += self._kv([
+                    ("Policy URL", self._code(mta.url)),
+                    ("Fetched", mta.present if mta.present else state(mta)),
+                    ("Version", mta.version), ("Mode", enforcing), ("max_age", mta.max_age),
+                    ("MX patterns", mta.mx),
+                    ("Valid per RFC 8461", self._pill("yes", "ok") if mta.valid
+                     else self._pill("no", "failed")),
+                    ("Parse errors", mta.parse_errors)])
         urls = d.sitemap_urls()
         if urls:
             out += f"<h3>Sitemap URLs ({len(urls)})</h3><ul>" + "".join(f"<li>{self._code(u)}</li>" for u in urls[:200]) + "</ul>"
