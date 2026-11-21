@@ -20,7 +20,6 @@ the next, not-yet-started frontier.
 | **5** | Active network recon, auto-discovery & regression | `port_scan`, `traceroute`; `--bypass-sec` + auto-discovery of effective authorization; cross-scan `FindingDelta` and `regression.*` findings; cross-module correlation; confidence calibration; CI gates (`--fail-on`, `--fail-on-new`) | ✅ shipped (PR #2) **← current** |
 | **5.5** | Passive data enrichment | Passive subdomain sources (OTX, urlscan, Common Crawl, Wayback, RapidDNS, HackerTarget, Anubis, BufferOver) with per-source outcomes and caching; controlled DNS-confirmed permutation; historical-URL module (archived endpoints, parameters, legacy-stack hints); 541 technology signatures with weak-source-aware grading and `?ver=` version recovery; managed-cloud inventory and findings | ✅ shipped (schema **2.4**) |
 | **5.6** | On-page SEO audit | `seo` module deriving per-page SEO facts from pages already fetched (indexability, metadata, heading outline, word count, alt coverage, link graph, structured data); site-wide aggregates (duplicate titles/descriptions/H1s, orphans, broken internal links, redirects, sitemap-vs-robots-vs-crawl coverage, apex/www canonicalization, delivery); a 39-entry declarative check table driving both findings and a separate A–F SEO grade with `not_checked` states and proportional deductions | ✅ shipped (schema **2.5**) |
-| **5.7** | Closing published limitations | Bundled HSTS preload snapshot (membership answered offline, with `not_checked` when the snapshot is unusable) and the four-way membership/eligibility split; MTA-STS policy fetch and RFC 8461 validation (enforce vs testing, MX coverage, max_age), with the record and the policy judged together | ✅ shipped |
 | **6** | Dynamic rendering & deep testing | Headless-browser rendering (Playwright) to capture runtime DOM/endpoints and close the SPA gap; authenticated/session testing; business-logic probing | ⛔ not started |
 
 **Where we are:** Phase 5 is complete (merged as PR #2), followed by a code-review
@@ -397,33 +396,6 @@ reintroduce: extracting `script` elements to exclude them from a word count dest
 `<body>` before the structured-data inventory could read it (text nodes are now filtered, not removed); and
 building a sitemap audit even when the `resources` module had not run reported "no robots.txt" for a file
 that was never fetched (the audit is now `None`, so the check reports `not_checked`).
-
-# Closing published limitations — what shipped
-
-The `LIMITATIONS` table is a backlog in disguise: each entry is a documented gap, and two of them needed
-no third party to close.
-
-**HSTS preload membership.** `http.hsts_not_preload_ready` previously said it checked "the header's
-preload eligibility from its directives, not actual membership". Membership is now answered from a
-bundled, reduced snapshot of Chromium's list (95k entries, 563 KB gzipped, refreshed with
-`scripts/refresh_hsts_preload.py`), following the Public Suffix List precedent — a public answer that
-needs no network, so hstspreload.org never learns the target. The pairing is what carries information:
-preloaded *and* ineligible is its own finding, because browsers upgrade regardless of today's header,
-resubmission would be rejected, and list removal takes months.
-
-**MTA-STS policy.** `email.mta_sts_missing` previously said "the policy file itself (enforce vs testing
-mode) is not fetched". It is now fetched from `mta-sts.<domain>`, but only when DNS shows MX records —
-without them no sender ever consults a policy, and that case is recorded as `not_applicable` rather than
-as an absence. The record and the policy are judged together so the report names one fault instead of two
-halves: a record with no reachable policy, or a policy nobody announces. The check with operational teeth
-is MX coverage: under `enforce`, a sender refuses delivery to an MX the policy omits, so an uncovered MX
-predicts lost mail (medium) rather than weak configuration (low in testing mode).
-
-Two design notes worth keeping. Membership and policy mode both became observations, so the scan diff
-catches a delisting or a silent `enforce` → `testing` regression that no header or DNS record would
-reveal. And the MX-coverage comparison had to live in the analysis layer, not on the parser: `analysis`
-importing from `modules` is a circular import, and the rule it enforces is the right one — parsing is
-evidence, comparing two modules' evidence is interpretation.
 
 ## Follow-up for later phases
 
